@@ -1107,6 +1107,9 @@ struct fuse_conn {
 		unsigned int req_timeout;
 	} timeout;
 
+	/* The foffset alignment in PAGE */
+	unsigned int alignment_pages;
+
 	/**
 	 * XArray tracking tasks that need DLM retry.
 	 * Maps task pointer -> struct fuse_dlm_retry.

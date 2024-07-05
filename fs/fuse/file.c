@@ -2857,6 +2857,32 @@ static bool fuse_folios_need_send(struct fuse_conn *fc, loff_t pos,
 	return false;
 }
 
+/*
+ * A server that asked for an alignment wants its writes to start on it.  Close
+ * the run at an aligned position when the next aligned run cannot be reached,
+ * either because writeback ends before it or because it would not fit.
+ */
+static bool fuse_writeback_reached_alignment(struct fuse_conn *fc, loff_t pos,
+					     unsigned int bytes,
+					     struct writeback_control *wbc)
+{
+	unsigned int total_pages = (bytes + PAGE_SIZE - 1) >> PAGE_SHIFT;
+	pgoff_t page_index = pos >> PAGE_SHIFT;
+	pgoff_t end_page_index;
+
+	if (!fc->alignment_pages)
+		return false;
+
+	if (page_index % fc->alignment_pages)
+		return false;
+
+	end_page_index = (wbc->range_end + PAGE_SIZE - 1) >> PAGE_SHIFT;
+	if (page_index + fc->alignment_pages > end_page_index)
+		return true;
+
+	return total_pages + fc->alignment_pages > fc->max_pages;
+}
+
 static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 					  struct folio *folio, u64 pos,
 					  unsigned len, u64 end_pos)
@@ -2889,6 +2915,10 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 			send = (ap->num_folios == data->max_folios) &&
 				!fuse_pages_realloc(data, fc->max_pages);
 		}
+
+		if (!send)
+			send = fuse_writeback_reached_alignment(fc, pos,
+					data->nr_bytes + len, wpc->wbc);
 
 		if (send) {
 			fuse_writepages_send(inode, data);
