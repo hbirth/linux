@@ -21,6 +21,10 @@ MODULE_PARM_DESC(enable_uring,
 #define FUSE_RING_HEADER_PG 0
 #define FUSE_RING_PAYLOAD_PG 1
 
+#ifndef IO_URING_F_TASK_DEAD
+#define IO_URING_F_TASK_DEAD (1 << 13)
+#endif
+
 bool fuse_uring_enabled(void)
 {
 	return enable_uring;
@@ -31,6 +35,14 @@ struct fuse_uring_pdu {
 };
 
 static const struct fuse_iqueue_ops fuse_io_uring_ops;
+
+static inline void io_uring_cmd_private_sz_check(size_t cmd_sz)
+{
+	BUILD_BUG_ON(cmd_sz > sizeof_field(struct io_uring_cmd, pdu));
+}
+#define io_uring_cmd_to_pdu(cmd, pdu_type)                \
+	(io_uring_cmd_private_sz_check(sizeof(pdu_type)), \
+	 ((pdu_type *)&(cmd)->pdu))
 
 static void uring_cmd_set_ring_ent(struct io_uring_cmd *cmd,
 				   struct fuse_ring_ent *ring_ent)
