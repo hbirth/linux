@@ -1197,11 +1197,6 @@ int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 	u32 cmd_op = cmd->cmd_op;
 	int err;
 
-	if (!enable_uring) {
-		pr_info_ratelimited("fuse-io-uring is disabled\n");
-		return -EOPNOTSUPP;
-	}
-
 #ifdef IO_URING_F_CANCEL
 	if ((unlikely(issue_flags & IO_URING_F_CANCEL))) {
 		fuse_uring_cancel(cmd, issue_flags);
@@ -1219,6 +1214,12 @@ int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 		return -ENOTCONN;
 	}
 	fc = fud->fc;
+
+	/* Once a connection has io-uring enabled on it, it can't be disabled */
+	if (!enable_uring && !fc->io_uring) {
+		pr_info_ratelimited("fuse-io-uring is disabled\n");
+		return -EOPNOTSUPP;
+	}
 
 	if (fc->aborted)
 		return -ECONNABORTED;
