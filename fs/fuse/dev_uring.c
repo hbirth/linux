@@ -832,7 +832,7 @@ static void fuse_uring_add_req_to_ring_ent(struct fuse_ring_ent *ring_ent,
 		pr_warn("%s qid=%d state=%d\n", __func__, ring_ent->queue->qid,
 			ring_ent->state);
 	}
-	list_del_init(&req->list);
+
 	clear_bit(FR_PENDING, &req->flags);
 	ring_ent->fuse_req = req;
 	ring_ent->state = FRRS_FUSE_REQ;
@@ -1487,6 +1487,8 @@ void fuse_uring_queue_fuse_req(struct fuse_iqueue *fiq, struct fuse_req *req)
 	if (unlikely(queue->stopped))
 		goto err_unlock;
 
+	set_bit(FR_URING, &req->flags);
+	req->ring_queue = queue;
 	ent = list_first_entry_or_null(&queue->ent_avail_queue,
 				       struct fuse_ring_ent, list);
 	if (ent)
@@ -1525,6 +1527,8 @@ bool fuse_uring_queue_bq_req(struct fuse_req *req)
 		return false;
 	}
 
+	set_bit(FR_URING, &req->flags);
+	req->ring_queue = queue;
 	list_add_tail(&req->list, &queue->fuse_req_bg_queue);
 
 	ent = list_first_entry_or_null(&queue->ent_avail_queue,
@@ -1553,6 +1557,15 @@ bool fuse_uring_queue_bq_req(struct fuse_req *req)
 	}
 
 	return true;
+}
+
+bool fuse_uring_remove_pending_req(struct fuse_req *req,
+				   bool (*remove_fn)(struct fuse_req *req,
+						     spinlock_t *lock))
+{
+	struct fuse_ring_queue *queue = req->ring_queue;
+
+	return remove_fn(req, &queue->lock);
 }
 
 static const struct fuse_iqueue_ops fuse_io_uring_ops = {
