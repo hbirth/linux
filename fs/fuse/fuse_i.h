@@ -84,6 +84,17 @@ struct fuse_submount_lookup {
 	struct fuse_forget_link *forget;
 };
 
+/**
+ * data structure to save the information that we have
+ * requested dlm locks for the given area from the fuse server
+*/
+struct dlm_locked_area
+{
+	struct list_head list;
+	loff_t offset;
+	size_t size;
+};
+
 /** FUSE inode */
 struct fuse_inode {
 	/** Inode data */
@@ -142,6 +153,9 @@ struct fuse_inode {
 
 			/* List of writepage requestst (pending or sent) */
 			struct rb_root writepages;
+
+			/** List of dlm locked areas we have sent lock requests for */
+			struct list_head dlm_locked_areas;
 		};
 
 		/* readdir cache (directory only) */
@@ -834,6 +848,9 @@ struct fuse_conn {
 
 	/* Is statx not implemented by fs? */
 	unsigned int no_statx:1;
+
+	/* do we have support for dlm in the fs? */
+	unsigned int no_dlm:1;
 
 	/* Use io_uring for communication */
 	unsigned int io_uring;

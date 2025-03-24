@@ -220,6 +220,8 @@
  *    - FUSE_URING_IN_OUT_HEADER_SZ
  *    - FUSE_URING_OP_IN_OUT_SZ
  *    - enum fuse_uring_cmd
+ *	7.43
+ *  - add FUSE_DLM_LOCK
  */
 
 #ifndef _LINUX_FUSE_H
@@ -632,6 +634,7 @@ enum fuse_opcode {
 	FUSE_SYNCFS		= 50,
 	FUSE_TMPFILE		= 51,
 	FUSE_STATX		= 52,
+	FUSE_DLM_LOCK 	= 53,
 
 	/* CUSE specific operations */
 	CUSE_INIT		= 4096,
@@ -1164,6 +1167,40 @@ struct fuse_ext_header {
 struct fuse_supp_groups {
 	uint32_t	nr_groups;
 	uint32_t	groups[];
+};
+
+/**
+ * Type of the dlm lock requested
+ */
+enum fuse_dlm_lock_type {
+	FUSE_DLM_LOCK_NONE = 0,
+	FUSE_DLM_LOCK_READ = 1,
+	FUSE_DLM_LOCK_WRITE = 2
+};
+
+/**
+ * struct fuse_dlm_lock_in - Lock request
+ * @fh: file handle
+ * @offset: offset into the file
+ * @size: size of the locked region
+ * @type: type of lock
+ */
+struct fuse_dlm_lock_in {
+	uint64_t    fh;
+	uint64_t    offset;
+	uint32_t    size;
+	uint32_t    type;
+};
+
+/**
+ * struct fuse_dlm_lock_out - Lock response
+ * @locksize: how many bytes where locked by the call
+ * (most of the time we want to lock more than is requested
+ * to reduce number of calls)
+ */
+struct fuse_dlm_lock_out {
+	uint32_t locksize;
+	uint32_t padding;
 };
 
 /**
