@@ -8,6 +8,7 @@
 
 #include "fuse_i.h"
 
+#include "linux/printk.h"
 #include <linux/pagemap.h>
 #include <linux/slab.h>
 #include <linux/kernel.h>
@@ -1440,6 +1441,56 @@ static void fuse_dio_unlock(struct kiocb *iocb, bool exclusive)
 	}
 }
 
+static bool fuse_dlm_locked(struct file *file, loff_t offset, size_t length)
+{
+	struct inode *inode = file_inode(file);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+
+	/* if dlm is not supported by fuse server don't bother */
+	if (fc->no_dlm)
+		return false;
+
+	return false; /* for now, insert multiple lock handling here */
+}
+
+static void fuse_get_dlm_write_lock(struct file *file, loff_t offset, size_t length)
+{
+	struct fuse_file *ff = file->private_data;
+	struct inode *inode = file_inode(file);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_mount *fm = ff->fm;
+
+	FUSE_ARGS(args);
+	struct fuse_dlm_lock_in inarg;
+	struct fuse_dlm_lock_out outarg;
+	int err;
+
+	/* if fuse server does not support dlm, return */
+	if (fc->no_dlm)
+		return;
+
+	memset(&inarg, 0, sizeof(inarg));
+	inarg.fh = ff->fh;
+	inarg.offset = offset;
+	inarg.size = length;
+	inarg.type = FUSE_DLM_LOCK_WRITE;
+
+	args.opcode = FUSE_DLM_LOCK;
+	args.nodeid = get_node_id(inode);
+	args.in_numargs = 1;
+	args.in_args[0].size = sizeof(inarg);
+	args.in_args[0].value = &inarg;
+	args.out_numargs = 1;
+	args.out_args[0].size = sizeof(outarg);
+	args.out_args[0].value = &outarg;
+	err = fuse_simple_request(fm, &args);  
+	if (err == -ENOSYS) {
+		/* fuse server told us it does not support dlm, save the info */
+		fc->no_dlm = 1;
+	}
+	/* don't handle lock id from outarg at the moment */
+}
+
 static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
@@ -1449,7 +1500,9 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct inode *inode = mapping->host;
 	ssize_t err, count;
 	struct fuse_conn *fc = get_fuse_conn(inode);
-
+	loff_t pos = iocb->ki_pos;
+	size_t length = iov_iter_count(from);
+	
 	if (fc->writeback_cache) {
 		/* Update size (EOF optimization) and mode (SUID clearing) */
 		err = fuse_update_attributes(mapping->host, file,
@@ -1463,6 +1516,11 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			goto writethrough;
 		}
 
+		if (!fuse_dlm_locked(file, pos, length)) {
+			printk("fuse acquire DLM wlock %lld %ld\n", pos, length);
+			fuse_get_dlm_write_lock(file, pos, length);
+		}
+			
 		return generic_file_write_iter(iocb, from);
 	}
 

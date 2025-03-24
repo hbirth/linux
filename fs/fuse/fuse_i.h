@@ -867,6 +867,9 @@ struct fuse_conn {
 	/* Use pages instead of pointer for kernel I/O */
 	unsigned int use_pages_for_kvec_io:1;
 
+	/* do we have support for dlm in the fs? */
+	unsigned int no_dlm:1;
+
 	/* Use io_uring for communication */
 	unsigned int io_uring;
 
