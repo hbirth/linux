@@ -9,6 +9,7 @@
 #include "fuse_i.h"
 #include "dev_uring_i.h"
 
+#include "linux/list.h"
 #include <linux/pagemap.h>
 #include <linux/slab.h>
 #include <linux/file.h>
@@ -152,6 +153,22 @@ static void fuse_cleanup_submount_lookup(struct fuse_conn *fc,
 	kfree(sl);
 }
 
+static void fuse_forget_all_dlm_lock_areas(struct fuse_inode *fi)
+{
+	spin_lock(&fi->lock);
+	/* forget about the dlm locks */
+	if (!list_empty(&fi->dlm_locked_areas)) {
+		struct dlm_locked_area *area, *tmp;
+		list_for_each_entry_safe(area, tmp, &fi->dlm_locked_areas, list) {
+			list_del(&area->list);
+			printk("free area %lld size: %ld\n", area->offset, area->size);
+			kfree(area);
+		}
+	}
+	spin_unlock(&fi->lock);
+}
+
+
 static void fuse_evict_inode(struct inode *inode)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
@@ -189,6 +206,7 @@ static void fuse_evict_inode(struct inode *inode)
 		WARN_ON(fi->iocachectr != 0);
 		WARN_ON(!list_empty(&fi->write_files));
 		WARN_ON(!list_empty(&fi->queued_writes));
+		fuse_forget_all_dlm_lock_areas(fi);
 	}
 }
 
@@ -566,6 +584,7 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 
 	fuse_invalidate_attr(inode);
 	forget_all_cached_acls(inode);
+	fuse_forget_all_dlm_lock_areas(fi);
 	if (offset >= 0) {
 		pg_start = offset >> PAGE_SHIFT;
 		if (len <= 0)

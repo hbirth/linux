@@ -8,6 +8,9 @@
 
 #include "fuse_i.h"
 
+#include "linux/list.h"
+#include "linux/printk.h"
+#include "linux/spinlock.h"
 #include <linux/pagemap.h>
 #include <linux/slab.h>
 #include <linux/kernel.h>
@@ -1440,6 +1443,152 @@ static void fuse_dio_unlock(struct kiocb *iocb, bool exclusive)
 	}
 }
 
+static bool fuse_dlm_locked(struct file* file, loff_t offset, size_t length)
+{
+	struct inode *inode = file_inode(file);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct dlm_locked_area *area;
+
+	/* if dlm is not supported by fuse server, don't bother */
+	if (fc->no_dlm)
+		return true;
+
+	/* check the locked areas for the given offset and length */
+	list_for_each_entry(area, &fi->dlm_locked_areas, list) {
+		loff_t current_area_start_offset = area->offset;
+		loff_t current_area_end_offset = area->offset + area->size;
+		loff_t lock_end_offset = offset + length;
+		loff_t lock_start_offset = offset;
+
+		/* check if the locked areas are completely distinct, then we should continue */
+		if (current_area_end_offset < lock_start_offset
+			|| current_area_start_offset > lock_end_offset)
+			continue;
+
+		/* check if the given offset and length completely overlaps with the current area */
+		if (current_area_start_offset <= lock_start_offset
+			&& current_area_end_offset >= lock_end_offset) {
+			return true;
+		}
+
+		/* lock area has segment after the current area */
+		if(current_area_start_offset < lock_start_offset
+			&& current_area_end_offset > lock_start_offset
+			&& current_area_end_offset < lock_end_offset) {
+			offset = current_area_end_offset;
+			length = lock_end_offset - current_area_end_offset;
+			/* check all other areas for the part at the end of the locked area */
+			return fuse_dlm_locked(file, offset, length);
+		}
+
+		/* lock area has segment before the current area */
+		if (lock_start_offset < current_area_start_offset
+			&& lock_end_offset > current_area_start_offset
+			&& lock_end_offset < current_area_end_offset) {
+			offset = lock_start_offset;
+			length = current_area_start_offset - lock_start_offset;
+			/* check all other areas for the rest of the part */
+			return fuse_dlm_locked(file, offset, length);
+		}
+
+		/* If the lock area is larger than the current area, continue, some other areas might match partially
+		 * If they don't we return false and the bigger chunk will be locked and merged with the partially matching one anyway.
+		 * This is a case the fuse server has to be able to handle.
+		 */
+	}
+	return false;
+}
+
+/**
+ * check if the given offset and length extends the already locked area or we have to create a new area
+ */
+static void check_and_add_locked_area(struct fuse_inode *fi, loff_t offset, size_t length) {
+	struct dlm_locked_area *area;
+
+	spin_lock(&fi->lock);
+	/* iterate through the areas */
+	list_for_each_entry(area, &fi->dlm_locked_areas, list) {
+		loff_t current_area_start_offset = area->offset;
+		loff_t current_area_end_offset = area->offset + area->size;
+		loff_t lock_end_offset = offset + length;
+		loff_t lock_start_offset = offset;
+
+		/* if we have overlap, extend the locked area */
+		if (lock_start_offset >= current_area_start_offset && lock_start_offset <= current_area_end_offset) {
+			area->offset = MIN(current_area_start_offset, lock_start_offset);
+			area->size = MAX(current_area_end_offset, lock_end_offset) - area->offset;
+			printk("extended locked area %lld size: %ld\n", area->offset, area->size);
+			spin_unlock(&fi->lock);
+			return;
+		}
+	}
+
+	/* create a new locked area */
+	area = kmalloc(sizeof(struct dlm_locked_area), GFP_KERNEL);
+	area->offset = offset;
+	area->size = length;
+	list_add_tail(&area->list, &fi->dlm_locked_areas);
+	spin_unlock(&fi->lock);
+
+	printk("added new locked area %lld size: %ld\n", offset, length);
+}
+
+/**
+ * request a dlm lock from the fuse server
+ */
+static void fuse_get_dlm_write_lock(struct file *file, loff_t offset, size_t length)
+{
+	struct fuse_file *ff = file->private_data;
+	struct inode *inode = file_inode(file);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct fuse_mount *fm = ff->fm;
+
+	FUSE_ARGS(args);
+	struct fuse_dlm_lock_in inarg;
+	struct fuse_dlm_lock_out outarg;
+	int err;
+
+	/* note that the offset and length don't have to be page aligned here
+	   but since we only get here on writeback caching we will send out
+	   page aligned requests */
+	offset &= PAGE_MASK;
+	length = PAGE_ALIGN(offset + length) - offset;
+
+	if (fuse_dlm_locked(file, offset, length))
+		return; /* we already have this area locked */
+
+	memset(&inarg, 0, sizeof(inarg));
+	inarg.fh = ff->fh;
+
+	inarg.offset = offset;
+	inarg.size = length;
+	inarg.type = FUSE_DLM_LOCK_WRITE;
+
+	args.opcode = FUSE_DLM_LOCK;
+	args.nodeid = get_node_id(inode);
+	args.in_numargs = 1;
+	args.in_args[0].size = sizeof(inarg);
+	args.in_args[0].value = &inarg;
+	args.out_numargs = 1;
+	args.out_args[0].size = sizeof(outarg);
+	args.out_args[0].value = &outarg;
+	err = fuse_simple_request(fm, &args);
+	if (err == -ENOSYS) {
+		/* fuse server told us it does not support dlm, save the info */
+		fc->no_dlm = 1;
+	}
+
+	if (err)
+		return;
+
+	/* add the lock to the list of locked areas */
+	if (outarg.locksize) {
+		check_and_add_locked_area(fi, offset, outarg.locksize);
+	}
+}
+
 static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
@@ -1449,6 +1598,8 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct inode *inode = mapping->host;
 	ssize_t err, count;
 	struct fuse_conn *fc = get_fuse_conn(inode);
+	loff_t pos = iocb->ki_pos;
+	size_t length = iov_iter_count(from);
 
 	if (fc->writeback_cache) {
 		/* Update size (EOF optimization) and mode (SUID clearing) */
@@ -1462,6 +1613,11 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 						file_inode(file))) {
 			goto writethrough;
 		}
+
+		/* if we have dlm support acquire the lock for the area
+		 * we are writing into */
+		if (!fc->no_dlm)
+			fuse_get_dlm_write_lock(file, pos, length);
 
 		return generic_file_write_iter(iocb, from);
 	}
@@ -3435,6 +3591,7 @@ void fuse_init_file_inode(struct inode *inode, unsigned int flags)
 
 	INIT_LIST_HEAD(&fi->write_files);
 	INIT_LIST_HEAD(&fi->queued_writes);
+	INIT_LIST_HEAD(&fi->dlm_locked_areas);
 	fi->writectr = 0;
 	fi->iocachectr = 0;
 	init_waitqueue_head(&fi->page_waitq);
