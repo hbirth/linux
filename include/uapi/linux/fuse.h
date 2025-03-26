@@ -229,6 +229,8 @@
  *    - FUSE_URING_IN_OUT_HEADER_SZ
  *    - FUSE_URING_OP_IN_OUT_SZ
  *    - enum fuse_uring_cmd
+ *	7.43
+ *  - add FUSE_DLM_LOCK
  */
 
 #ifndef _LINUX_FUSE_H
@@ -264,7 +266,7 @@
 #define FUSE_KERNEL_VERSION 7
 
 /** Minor version number of this interface */
-#define FUSE_KERNEL_MINOR_VERSION 42
+#define FUSE_KERNEL_MINOR_VERSION 43
 
 /** The node ID of the root inode */
 #define FUSE_ROOT_ID 1
