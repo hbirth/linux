@@ -7,6 +7,7 @@
 #include "fuse_i.h"
 #include "dev_uring_i.h"
 #include "fuse_dev_i.h"
+#include "fuse_trace.h"
 
 #include <linux/fs.h>
 #include <linux/io_uring/cmd.h>
@@ -772,6 +773,7 @@ static int fuse_uring_send_next_to_ring(struct fuse_ring_ent *ring_ent,
 	int err = 0;
 	struct fuse_ring_queue *queue = ring_ent->queue;
 	struct io_uring_cmd *cmd;
+	struct fuse_req *req;
 
 	err = fuse_uring_prepare_send(ring_ent);
 	if (err)
@@ -779,11 +781,13 @@ static int fuse_uring_send_next_to_ring(struct fuse_ring_ent *ring_ent,
 
 	spin_lock(&queue->lock);
 	ring_ent->state = FRRS_USERSPACE;
+	req = ring_ent->fuse_req;
 	cmd = ring_ent->cmd;
 	ring_ent->cmd = NULL;
 	list_move(&ring_ent->list, &queue->ent_in_userspace);
 	spin_unlock(&queue->lock);
 
+	trace_fuse_request_send(req);
 	io_uring_cmd_done(cmd, 0, 0, issue_flags);
 	return 0;
 }
@@ -1382,6 +1386,7 @@ static void fuse_uring_send(struct fuse_ring_ent *ent, struct io_uring_cmd *cmd,
 	list_move(&ent->list, &queue->ent_in_userspace);
 	spin_unlock(&queue->lock);
 
+	trace_fuse_request_send(ent->fuse_req);
 	io_uring_cmd_done(cmd, ret, 0, issue_flags);
 }
 
