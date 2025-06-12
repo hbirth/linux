@@ -1471,8 +1471,8 @@ static void check_and_add_locked_area(struct fuse_inode *fi, loff_t offset, size
 
 		/* if we have overlap, extend the locked area */
 		if (lock_start_offset >= current_area_start_offset && lock_start_offset <= current_area_end_offset) {
-			area->offset = MIN(current_area_start_offset, lock_start_offset);
-			area->size = MAX(current_area_end_offset, lock_end_offset) - area->offset;
+			area->offset = min(current_area_start_offset, lock_start_offset);
+			area->size = max(current_area_end_offset, lock_end_offset) - area->offset;
 			spin_unlock(&fi->lock);
 			return;
 		}
