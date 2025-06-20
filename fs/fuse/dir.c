@@ -6,6 +6,7 @@
   See the file COPYING.
 */
 
+#include "fuse_dlm_cache.h"
 #include "fuse_i.h"
 
 #include <linux/pagemap.h>
@@ -1924,6 +1925,8 @@ int fuse_do_setattr(struct dentry *dentry, struct iattr *attr,
 			 * truncation has already been done by OPEN.  But still
 			 * need to truncate page cache.
 			 */
+			if (fc->dlm && fc->writeback_cache)
+				fuse_dlm_cache_release_locks(fi);
 			i_size_write(inode, 0);
 			truncate_pagecache(inode, 0);
 			goto out;
@@ -2029,6 +2032,9 @@ int fuse_do_setattr(struct dentry *dentry, struct iattr *attr,
 	 */
 	if ((is_truncate || !is_wb) &&
 	    S_ISREG(inode->i_mode) && oldsize != outarg.attr.size) {
+		if (fc->dlm && fc->writeback_cache)
+			fuse_dlm_unlock_range(fi, outarg.attr.size & PAGE_MASK, -1);
+
 		truncate_pagecache(inode, outarg.attr.size);
 		invalidate_inode_pages2(mapping);
 	}
