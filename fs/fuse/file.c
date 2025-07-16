@@ -879,8 +879,11 @@ static int fuse_do_readpage(struct file *file, struct page *page)
 
 	fuse_read_args_fill(&ia, file, pos, desc.length, FUSE_READ);
 	res = fuse_simple_request(fm, &ia.ap.args);
-	if (res < 0)
+	if (res < 0) {
+		if (res == -EAGAIN)
+			res = AOP_TRUNCATED_PAGE;
 		return res;
+	}
 	/*
 	 * Short read means EOF.  If file size is larger, truncate it
 	 */
