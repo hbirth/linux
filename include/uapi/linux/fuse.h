@@ -226,8 +226,6 @@
  *    - FUSE_URING_IN_OUT_HEADER_SZ
  *    - FUSE_URING_OP_IN_OUT_SZ
  *    - enum fuse_uring_cmd
- *  7.43
- *  - add opt_alignment to fuse_init_out, add FUSE_ALIGN_PG_ORDER init flag
  */
 
 #ifndef _LINUX_FUSE_H
@@ -432,7 +430,7 @@ struct fuse_file_lock {
  * FUSE_INVAL_INODE_ENTRY: invalidate inode aliases when doing inode invalidation
  * FUSE_EXPIRE_INODE_ENTRY: expire inode aliases when doing inode invalidation
  * FUSE_ALIGN_PG_ORDER: page order (power of 2 exponent for number of pages) for
- *			optimimal io-size alignment
+ *			optimal io-size alignment
  */
 #define FUSE_ASYNC_READ		(1 << 0)
 #define FUSE_POSIX_LOCKS	(1 << 1)
@@ -473,11 +471,13 @@ struct fuse_file_lock {
 #define FUSE_HAS_EXPIRE_ONLY	(1ULL << 35)
 #define FUSE_DIRECT_IO_ALLOW_MMAP (1ULL << 36)
 #define FUSE_NO_EXPORT_SUPPORT	(1ULL << 38)
-#define FUSE_ALIGN_PG_ORDER	(1ULL << 40)
 
 /* Obsolete alias for FUSE_DIRECT_IO_ALLOW_MMAP */
 #define FUSE_DIRECT_IO_RELAX	FUSE_DIRECT_IO_ALLOW_MMAP
 #define FUSE_OVER_IO_URING	(1ULL << 41)
+
+#define FUSE_ALIGN_PG_ORDER	(1ULL << 50)
+
 #define FUSE_INVAL_INODE_ENTRY  (1ULL << 60)
 #define FUSE_EXPIRE_INODE_ENTRY (1ULL << 61)
 

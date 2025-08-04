@@ -2006,7 +2006,7 @@ static bool fuse_writepage_need_send(struct fuse_conn *fc, struct page *page,
 		return true;
 
 	/* Reached alignment */
-	if (fc->alignment_pages && !(folio->index % fc->alignment_pages))
+	if (fc->alignment_pages && !(page->index % fc->alignment_pages))
 		return true;
 
 	return false;
