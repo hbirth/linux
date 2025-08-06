@@ -7,6 +7,7 @@
 */
 
 #include "fuse_i.h"
+#include "fuse_dlm_cache.h"
 
 #include <linux/pagemap.h>
 #include <linux/slab.h>
@@ -415,83 +416,20 @@ u64 fuse_lock_owner_id(struct fuse_conn *fc, fl_owner_t id)
 
 struct fuse_writepage_args {
 	struct fuse_io_args ia;
-	struct rb_node writepages_entry;
 	struct list_head queue_entry;
-	struct fuse_writepage_args *next;
 	struct inode *inode;
 	struct fuse_sync_bucket *bucket;
 };
 
-static struct fuse_writepage_args *fuse_find_writeback(struct fuse_inode *fi,
-					    pgoff_t idx_from, pgoff_t idx_to)
-{
-	struct rb_node *n;
-
-	n = fi->writepages.rb_node;
-
-	while (n) {
-		struct fuse_writepage_args *wpa;
-		pgoff_t curr_index;
-
-		wpa = rb_entry(n, struct fuse_writepage_args, writepages_entry);
-		WARN_ON(get_fuse_inode(wpa->inode) != fi);
-		curr_index = wpa->ia.write.in.offset >> PAGE_SHIFT;
-		if (idx_from >= curr_index + wpa->ia.ap.num_pages)
-			n = n->rb_right;
-		else if (idx_to < curr_index)
-			n = n->rb_left;
-		else
-			return wpa;
-	}
-	return NULL;
-}
-
-/*
- * Check if any page in a range is under writeback
- */
-static bool fuse_range_is_writeback(struct inode *inode, pgoff_t idx_from,
-				   pgoff_t idx_to)
-{
-	struct fuse_inode *fi = get_fuse_inode(inode);
-	bool found;
-
-	if (RB_EMPTY_ROOT(&fi->writepages))
-		return false;
-
-	spin_lock(&fi->lock);
-	found = fuse_find_writeback(fi, idx_from, idx_to);
-	spin_unlock(&fi->lock);
-
-	return found;
-}
-
-static inline bool fuse_page_is_writeback(struct inode *inode, pgoff_t index)
-{
-	return fuse_range_is_writeback(inode, index, index);
-}
-
-/*
- * Wait for page writeback to be completed.
- *
- * Since fuse doesn't rely on the VM writeback tracking, this has to
- * use some other means.
- */
 static void fuse_wait_on_page_writeback(struct inode *inode, pgoff_t index)
 {
-	struct fuse_inode *fi = get_fuse_inode(inode);
-
-	wait_event(fi->page_waitq, !fuse_page_is_writeback(inode, index));
+    struct page *page = find_get_page(inode->i_mapping, index);
+    if (page) {
+        wait_on_page_writeback(page);
+        put_page(page);
+    }
 }
 
-/*
- * Wait for all pending writepages on the inode to finish.
- *
- * This is currently done by blocking further writes with FUSE_NOWRITE
- * and waiting for all sent writes to complete.
- *
- * This must be called under i_mutex, otherwise the FUSE_NOWRITE usage
- * could conflict with truncation.
- */
 static void fuse_sync_writes(struct inode *inode)
 {
 	fuse_set_nowrite(inode);
@@ -516,10 +454,6 @@ static int fuse_flush(struct file *file, fl_owner_t id)
 	err = write_inode_now(inode, 1);
 	if (err)
 		return err;
-
-	inode_lock(inode);
-	fuse_sync_writes(inode);
-	inode_unlock(inode);
 
 	err = filemap_check_errors(file->f_mapping);
 	if (err)
@@ -863,13 +797,6 @@ static int fuse_do_readpage(struct file *file, struct page *page)
 	ssize_t res;
 	u64 attr_ver;
 
-	/*
-	 * Page writeback can extend beyond the lifetime of the
-	 * page-cache page, so make sure we read a properly synced
-	 * page.
-	 */
-	fuse_wait_on_page_writeback(inode, page->index);
-
 	attr_ver = fuse_get_attr_version(fm->fc);
 
 	/* Don't overflow end offset */
@@ -878,8 +805,11 @@ static int fuse_do_readpage(struct file *file, struct page *page)
 
 	fuse_read_args_fill(&ia, file, pos, desc.length, FUSE_READ);
 	res = fuse_simple_request(fm, &ia.ap.args);
-	if (res < 0)
+	if (res < 0) {
+		if (res == -EAGAIN)
+			res = AOP_TRUNCATED_PAGE;
 		return res;
+	}
 	/*
 	 * Short read means EOF.  If file size is larger, truncate it
 	 */
@@ -1419,6 +1349,17 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			goto writethrough;
 		}
 
+		/* if we have dlm support acquire the lock for the area
+		 * we are writing into */
+		if (fc->dlm) {
+			/* note that a file opened with O_APPEND will have relative values
+			 * in ki_pos. This code is here for convenience and for libfuse overlay test.
+			 * Filesystems should handle O_APPEND with 'direct io' to additionally
+			 * get the performance benefits of 'parallel direct writes'. */
+			loff_t pos = file->f_flags & O_APPEND ? i_size_read(inode) + iocb->ki_pos : iocb->ki_pos;
+			size_t length = iov_iter_count(from);
+			fuse_get_dlm_write_lock(file, pos, length);
+		}
 		return generic_file_write_iter(iocb, from);
 	}
 
@@ -1554,7 +1495,7 @@ ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
 			return res;
 		}
 	}
-	if (!cuse && fuse_range_is_writeback(inode, idx_from, idx_to)) {
+	if (!cuse && filemap_range_has_writeback(mapping, pos, pos + count - 1)) {
 		if (!write)
 			inode_lock(inode);
 		fuse_sync_writes(inode);
@@ -1718,13 +1659,9 @@ static ssize_t fuse_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 static void fuse_writepage_free(struct fuse_writepage_args *wpa)
 {
 	struct fuse_args_pages *ap = &wpa->ia.ap;
-	int i;
 
 	if (wpa->bucket)
 		fuse_sync_bucket_dec(wpa->bucket);
-
-	for (i = 0; i < ap->num_pages; i++)
-		__free_page(ap->pages[i]);
 
 	if (wpa->ia.ff)
 		fuse_file_put(wpa->ia.ff, false);
@@ -1742,11 +1679,12 @@ static void fuse_writepage_finish(struct fuse_mount *fm,
 	struct backing_dev_info *bdi = inode_to_bdi(inode);
 	int i;
 
-	for (i = 0; i < ap->num_pages; i++) {
-		dec_wb_stat(&bdi->wb, WB_WRITEBACK);
-		dec_node_page_state(ap->pages[i], NR_WRITEBACK_TEMP);
-		wb_writeout_inc(&bdi->wb);
-	}
+    for (i = 0; i < ap->num_pages; i++) {
+        dec_wb_stat(&bdi->wb, WB_WRITEBACK);
+		end_page_writeback(ap->pages[i]);
+        wb_writeout_inc(&bdi->wb);
+    }
+
 	wake_up(&fi->page_waitq);
 }
 
@@ -1756,7 +1694,6 @@ static void fuse_send_writepage(struct fuse_mount *fm,
 __releases(fi->lock)
 __acquires(fi->lock)
 {
-	struct fuse_writepage_args *aux, *next;
 	struct fuse_inode *fi = get_fuse_inode(wpa->inode);
 	struct fuse_write_in *inarg = &wpa->ia.write.in;
 	struct fuse_args *args = &wpa->ia.ap.args;
@@ -1792,23 +1729,8 @@ __acquires(fi->lock)
 
  out_free:
 	fi->writectr--;
-	rb_erase(&wpa->writepages_entry, &fi->writepages);
 	fuse_writepage_finish(fm, wpa);
 	spin_unlock(&fi->lock);
-
-	/* After rb_erase() aux request list is private */
-	for (aux = wpa->next; aux; aux = next) {
-		struct backing_dev_info *bdi = inode_to_bdi(aux->inode);
-
-		next = aux->next;
-		aux->next = NULL;
-
-		dec_wb_stat(&bdi->wb, WB_WRITEBACK);
-		dec_node_page_state(aux->ia.ap.pages[0], NR_WRITEBACK_TEMP);
-		wb_writeout_inc(&bdi->wb);
-		fuse_writepage_free(aux);
-	}
-
 	fuse_writepage_free(wpa);
 	spin_lock(&fi->lock);
 }
@@ -1836,43 +1758,6 @@ __acquires(fi->lock)
 	}
 }
 
-static struct fuse_writepage_args *fuse_insert_writeback(struct rb_root *root,
-						struct fuse_writepage_args *wpa)
-{
-	pgoff_t idx_from = wpa->ia.write.in.offset >> PAGE_SHIFT;
-	pgoff_t idx_to = idx_from + wpa->ia.ap.num_pages - 1;
-	struct rb_node **p = &root->rb_node;
-	struct rb_node  *parent = NULL;
-
-	WARN_ON(!wpa->ia.ap.num_pages);
-	while (*p) {
-		struct fuse_writepage_args *curr;
-		pgoff_t curr_index;
-
-		parent = *p;
-		curr = rb_entry(parent, struct fuse_writepage_args,
-				writepages_entry);
-		WARN_ON(curr->inode != wpa->inode);
-		curr_index = curr->ia.write.in.offset >> PAGE_SHIFT;
-
-		if (idx_from >= curr_index + curr->ia.ap.num_pages)
-			p = &(*p)->rb_right;
-		else if (idx_to < curr_index)
-			p = &(*p)->rb_left;
-		else
-			return curr;
-	}
-
-	rb_link_node(&wpa->writepages_entry, parent, p);
-	rb_insert_color(&wpa->writepages_entry, root);
-	return NULL;
-}
-
-static void tree_insert(struct rb_root *root, struct fuse_writepage_args *wpa)
-{
-	WARN_ON(fuse_insert_writeback(root, wpa));
-}
-
 static void fuse_writepage_end(struct fuse_mount *fm, struct fuse_args *args,
 			       int error)
 {
@@ -1892,42 +1777,6 @@ static void fuse_writepage_end(struct fuse_mount *fm, struct fuse_args *args,
 	if (!fc->writeback_cache)
 		fuse_invalidate_attr_mask(inode, FUSE_STATX_MODIFY);
 	spin_lock(&fi->lock);
-	rb_erase(&wpa->writepages_entry, &fi->writepages);
-	while (wpa->next) {
-		struct fuse_mount *fm = get_fuse_mount(inode);
-		struct fuse_write_in *inarg = &wpa->ia.write.in;
-		struct fuse_writepage_args *next = wpa->next;
-
-		wpa->next = next->next;
-		next->next = NULL;
-		next->ia.ff = fuse_file_get(wpa->ia.ff);
-		tree_insert(&fi->writepages, next);
-
-		/*
-		 * Skip fuse_flush_writepages() to make it easy to crop requests
-		 * based on primary request size.
-		 *
-		 * 1st case (trivial): there are no concurrent activities using
-		 * fuse_set/release_nowrite.  Then we're on safe side because
-		 * fuse_flush_writepages() would call fuse_send_writepage()
-		 * anyway.
-		 *
-		 * 2nd case: someone called fuse_set_nowrite and it is waiting
-		 * now for completion of all in-flight requests.  This happens
-		 * rarely and no more than once per page, so this should be
-		 * okay.
-		 *
-		 * 3rd case: someone (e.g. fuse_do_setattr()) is in the middle
-		 * of fuse_set_nowrite..fuse_release_nowrite section.  The fact
-		 * that fuse_set_nowrite returned implies that all in-flight
-		 * requests were completed along with all of their secondary
-		 * requests.  Further primary requests are blocked by negative
-		 * writectr.  Hence there cannot be any in-flight requests and
-		 * no invocations of fuse_writepage_end() while we're in
-		 * fuse_set_nowrite..fuse_release_nowrite section.
-		 */
-		fuse_send_writepage(fm, next, inarg->offset + inarg->size);
-	}
 	fi->writectr--;
 	fuse_writepage_finish(fm, wpa);
 	spin_unlock(&fi->lock);
@@ -2021,8 +1870,7 @@ static int fuse_writepage_locked(struct page *page)
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_writepage_args *wpa;
 	struct fuse_args_pages *ap;
-	struct page *tmp_page;
-	int error = -ENOMEM;
+	int error = -EIO;
 
 	set_page_writeback(page);
 
@@ -2031,44 +1879,32 @@ static int fuse_writepage_locked(struct page *page)
 		goto err;
 	ap = &wpa->ia.ap;
 
-	tmp_page = alloc_page(GFP_NOFS | __GFP_HIGHMEM);
-	if (!tmp_page)
-		goto err_free;
-
-	error = -EIO;
 	wpa->ia.ff = fuse_write_file_get(fi);
 	if (!wpa->ia.ff)
-		goto err_nofile;
+		goto err_free;
 
 	fuse_writepage_add_to_bucket(fc, wpa);
 	fuse_write_args_fill(&wpa->ia, wpa->ia.ff, page_offset(page), 0);
 
-	copy_highpage(tmp_page, page);
 	wpa->ia.write.in.write_flags |= FUSE_WRITE_CACHE;
-	wpa->next = NULL;
+
 	ap->args.in_pages = true;
 	ap->num_pages = 1;
-	ap->pages[0] = tmp_page;
+	ap->pages[0] = page;
 	ap->descs[0].offset = 0;
 	ap->descs[0].length = PAGE_SIZE;
 	ap->args.end = fuse_writepage_end;
 	wpa->inode = inode;
 
 	inc_wb_stat(&inode_to_bdi(inode)->wb, WB_WRITEBACK);
-	inc_node_page_state(tmp_page, NR_WRITEBACK_TEMP);
 
 	spin_lock(&fi->lock);
-	tree_insert(&fi->writepages, wpa);
 	list_add_tail(&wpa->queue_entry, &fi->queued_writes);
 	fuse_flush_writepages(inode);
 	spin_unlock(&fi->lock);
 
-	end_page_writeback(page);
-
 	return 0;
 
-err_nofile:
-	__free_page(tmp_page);
 err_free:
 	kfree(wpa);
 err:
@@ -2081,19 +1917,6 @@ static int fuse_writepage(struct page *page, struct writeback_control *wbc)
 {
 	struct fuse_conn *fc = get_fuse_conn(page->mapping->host);
 	int err;
-
-	if (fuse_page_is_writeback(page->mapping->host, page->index)) {
-		/*
-		 * ->writepages() should be called for sync() and friends.  We
-		 * should only get here on direct reclaim and then we are
-		 * allowed to skip a page which is already in flight
-		 */
-		WARN_ON(wbc->sync_mode == WB_SYNC_ALL);
-
-		redirty_page_for_writepage(wbc, page);
-		unlock_page(page);
-		return 0;
-	}
 
 	if (wbc->sync_mode == WB_SYNC_NONE &&
 	    fc->num_background >= fc->congestion_threshold)
@@ -2109,7 +1932,6 @@ struct fuse_fill_wb_data {
 	struct fuse_writepage_args *wpa;
 	struct fuse_file *ff;
 	struct inode *inode;
-	struct page **orig_pages;
 	unsigned int max_pages;
 };
 
@@ -2144,89 +1966,20 @@ static void fuse_writepages_send(struct fuse_fill_wb_data *data)
 	struct fuse_writepage_args *wpa = data->wpa;
 	struct inode *inode = data->inode;
 	struct fuse_inode *fi = get_fuse_inode(inode);
-	int num_pages = wpa->ia.ap.num_pages;
-	int i;
 
 	wpa->ia.ff = fuse_file_get(data->ff);
 	spin_lock(&fi->lock);
 	list_add_tail(&wpa->queue_entry, &fi->queued_writes);
 	fuse_flush_writepages(inode);
 	spin_unlock(&fi->lock);
-
-	for (i = 0; i < num_pages; i++)
-		end_page_writeback(data->orig_pages[i]);
 }
 
-/*
- * Check under fi->lock if the page is under writeback, and insert it onto the
- * rb_tree if not. Otherwise iterate auxiliary write requests, to see if there's
- * one already added for a page at this offset.  If there's none, then insert
- * this new request onto the auxiliary list, otherwise reuse the existing one by
- * swapping the new temp page with the old one.
- */
-static bool fuse_writepage_add(struct fuse_writepage_args *new_wpa,
-			       struct page *page)
-{
-	struct fuse_inode *fi = get_fuse_inode(new_wpa->inode);
-	struct fuse_writepage_args *tmp;
-	struct fuse_writepage_args *old_wpa;
-	struct fuse_args_pages *new_ap = &new_wpa->ia.ap;
-
-	WARN_ON(new_ap->num_pages != 0);
-	new_ap->num_pages = 1;
-
-	spin_lock(&fi->lock);
-	old_wpa = fuse_insert_writeback(&fi->writepages, new_wpa);
-	if (!old_wpa) {
-		spin_unlock(&fi->lock);
-		return true;
-	}
-
-	for (tmp = old_wpa->next; tmp; tmp = tmp->next) {
-		pgoff_t curr_index;
-
-		WARN_ON(tmp->inode != new_wpa->inode);
-		curr_index = tmp->ia.write.in.offset >> PAGE_SHIFT;
-		if (curr_index == page->index) {
-			WARN_ON(tmp->ia.ap.num_pages != 1);
-			swap(tmp->ia.ap.pages[0], new_ap->pages[0]);
-			break;
-		}
-	}
-
-	if (!tmp) {
-		new_wpa->next = old_wpa->next;
-		old_wpa->next = new_wpa;
-	}
-
-	spin_unlock(&fi->lock);
-
-	if (tmp) {
-		struct backing_dev_info *bdi = inode_to_bdi(new_wpa->inode);
-
-		dec_wb_stat(&bdi->wb, WB_WRITEBACK);
-		dec_node_page_state(new_ap->pages[0], NR_WRITEBACK_TEMP);
-		wb_writeout_inc(&bdi->wb);
-		fuse_writepage_free(new_wpa);
-	}
-
-	return false;
-}
 
 static bool fuse_writepage_need_send(struct fuse_conn *fc, struct page *page,
 				     struct fuse_args_pages *ap,
 				     struct fuse_fill_wb_data *data)
 {
 	WARN_ON(!ap->num_pages);
-
-	/*
-	 * Being under writeback is unlikely but possible.  For example direct
-	 * read to an mmaped fuse file will set the page dirty twice; once when
-	 * the pages are faulted with get_user_pages(), and then after the read
-	 * completed.
-	 */
-	if (fuse_page_is_writeback(data->inode, page->index))
-		return true;
 
 	/* Reached max pages */
 	if (ap->num_pages == fc->max_pages)
@@ -2237,7 +1990,7 @@ static bool fuse_writepage_need_send(struct fuse_conn *fc, struct page *page,
 		return true;
 
 	/* Discontinuity */
-	if (data->orig_pages[ap->num_pages - 1]->index + 1 != page->index)
+	if (ap->pages[ap->num_pages - 1]->index + 1 != page->index)
 		return true;
 
 	/* Need to grow the pages array?  If so, did the expansion fail? */
@@ -2256,7 +2009,6 @@ static int fuse_writepages_fill(struct folio *folio,
 	struct inode *inode = data->inode;
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_conn *fc = get_fuse_conn(inode);
-	struct page *tmp_page;
 	int err;
 
 	if (!data->ff) {
@@ -2271,31 +2023,11 @@ static int fuse_writepages_fill(struct folio *folio,
 		data->wpa = NULL;
 	}
 
-	err = -ENOMEM;
-	tmp_page = alloc_page(GFP_NOFS | __GFP_HIGHMEM);
-	if (!tmp_page)
-		goto out_unlock;
-
-	/*
-	 * The page must not be redirtied until the writeout is completed
-	 * (i.e. userspace has sent a reply to the write request).  Otherwise
-	 * there could be more than one temporary page instance for each real
-	 * page.
-	 *
-	 * This is ensured by holding the page lock in page_mkwrite() while
-	 * checking fuse_page_is_writeback().  We already hold the page lock
-	 * since clear_page_dirty_for_io() and keep it held until we add the
-	 * request to the fi->writepages list and increment ap->num_pages.
-	 * After this fuse_page_is_writeback() will indicate that the page is
-	 * under writeback, so we can release the page lock.
-	 */
 	if (data->wpa == NULL) {
 		err = -ENOMEM;
 		wpa = fuse_writepage_args_alloc();
-		if (!wpa) {
-			__free_page(tmp_page);
+		if (!wpa)
 			goto out_unlock;
-		}
 		fuse_writepage_add_to_bucket(fc, wpa);
 
 		data->max_pages = 1;
@@ -2303,36 +2035,23 @@ static int fuse_writepages_fill(struct folio *folio,
 		ap = &wpa->ia.ap;
 		fuse_write_args_fill(&wpa->ia, data->ff, folio_pos(folio), 0);
 		wpa->ia.write.in.write_flags |= FUSE_WRITE_CACHE;
-		wpa->next = NULL;
+		wpa->inode = inode;
+		wpa->ia.ff = data->ff;
 		ap->args.in_pages = true;
 		ap->args.end = fuse_writepage_end;
 		ap->num_pages = 0;
-		wpa->inode = inode;
 	}
 	folio_start_writeback(folio);
-
-	copy_highpage(tmp_page, &folio->page);
-	ap->pages[ap->num_pages] = tmp_page;
 	ap->descs[ap->num_pages].offset = 0;
 	ap->descs[ap->num_pages].length = PAGE_SIZE;
-	data->orig_pages[ap->num_pages] = &folio->page;
+	ap->pages[ap->num_pages] = &folio->page;
+	ap->num_pages++;
 
 	inc_wb_stat(&inode_to_bdi(inode)->wb, WB_WRITEBACK);
-	inc_node_page_state(tmp_page, NR_WRITEBACK_TEMP);
 
 	err = 0;
-	if (data->wpa) {
-		/*
-		 * Protected by fi->lock against concurrent access by
-		 * fuse_page_is_writeback().
-		 */
-		spin_lock(&fi->lock);
-		ap->num_pages++;
-		spin_unlock(&fi->lock);
-	} else if (fuse_writepage_add(wpa, &folio->page)) {
+	if (!data->wpa) {
 		data->wpa = wpa;
-	} else {
-		folio_end_writeback(folio);
 	}
 out_unlock:
 	folio_unlock(folio);
@@ -2360,13 +2079,6 @@ static int fuse_writepages(struct address_space *mapping,
 	data.wpa = NULL;
 	data.ff = NULL;
 
-	err = -ENOMEM;
-	data.orig_pages = kcalloc(fc->max_pages,
-				  sizeof(struct page *),
-				  GFP_NOFS);
-	if (!data.orig_pages)
-		goto out;
-
 	err = write_cache_pages(mapping, wbc, fuse_writepages_fill, &data);
 	if (data.wpa) {
 		WARN_ON(!data.wpa->ia.ap.num_pages);
@@ -2375,7 +2087,6 @@ static int fuse_writepages(struct address_space *mapping,
 	if (data.ff)
 		fuse_file_put(data.ff, false);
 
-	kfree(data.orig_pages);
 out:
 	return err;
 }
@@ -2486,6 +2197,57 @@ static void fuse_vma_close(struct vm_area_struct *vma)
 	mapping_set_error(vma->vm_file->f_mapping, err);
 }
 
+/**
+ * Request a DLM lock from the FUSE server.
+ *
+ * This routine is similar to fuse_get_dlm_write_lock(), but it
+ * does not cache the DLM lock in the kernel.
+ */
+static int fuse_get_page_mkwrite_lock(struct file *file, loff_t offset, size_t length)
+{
+	struct fuse_file *ff = file->private_data;
+	struct inode *inode = file_inode(file);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_mount *fm = ff->fm;
+
+	FUSE_ARGS(args);
+	struct fuse_dlm_lock_in inarg;
+	struct fuse_dlm_lock_out outarg;
+	int err;
+
+	if (WARN_ON_ONCE((offset & ~PAGE_MASK) || (length & ~PAGE_MASK)))
+		return -EIO;
+
+	memset(&inarg, 0, sizeof(inarg));
+	inarg.fh = ff->fh;
+
+	inarg.offset = offset;
+	inarg.size = length;
+	inarg.type = FUSE_DLM_PAGE_MKWRITE;
+
+	args.opcode = FUSE_DLM_WB_LOCK;
+	args.nodeid = get_node_id(inode);
+	args.in_numargs = 1;
+	args.in_args[0].size = sizeof(inarg);
+	args.in_args[0].value = &inarg;
+	args.out_numargs = 1;
+	args.out_args[0].size = sizeof(outarg);
+	args.out_args[0].value = &outarg;
+	err = fuse_simple_request(fm, &args);
+	if (err == -ENOSYS) {
+		fc->dlm = 0;
+		err = 0;
+	}
+
+	if (!err && fc->dlm && outarg.locksize < length) {
+		/* fuse server is seriously broken */
+		pr_warn("fuse: dlm lock request for %lu bytes returned %u bytes\n",
+			length, outarg.locksize);
+		fuse_abort_conn(fc);
+		err = -EINVAL;
+	}
+	return err;
+}
 /*
  * Wait for writeback against this page to complete before allowing it
  * to be marked dirty again, and hence written back again, possibly
@@ -2504,7 +2266,18 @@ static void fuse_vma_close(struct vm_area_struct *vma)
 static vm_fault_t fuse_page_mkwrite(struct vm_fault *vmf)
 {
 	struct page *page = vmf->page;
-	struct inode *inode = file_inode(vmf->vma->vm_file);
+	struct file *file = vmf->vma->vm_file;
+	struct inode *inode = file_inode(file);
+	struct fuse_mount *fm = get_fuse_mount(inode);
+
+	if (fm->fc->dlm) {
+		loff_t pos = vmf->pgoff << PAGE_SHIFT;
+		size_t length = PAGE_SIZE;
+		int err = fuse_get_page_mkwrite_lock(file, pos, length);
+		if (err < 0) {
+			return vmf_error(err);
+		}
+	}
 
 	file_update_time(vmf->vma->vm_file);
 	lock_page(page);
@@ -3328,11 +3101,11 @@ void fuse_init_file_inode(struct inode *inode, unsigned int flags)
 
 	INIT_LIST_HEAD(&fi->write_files);
 	INIT_LIST_HEAD(&fi->queued_writes);
+	fuse_dlm_cache_init(fi);
 	fi->writectr = 0;
 	fi->iocachectr = 0;
 	init_waitqueue_head(&fi->page_waitq);
 	init_waitqueue_head(&fi->direct_io_waitq);
-	fi->writepages = RB_ROOT;
 
 	if (IS_ENABLED(CONFIG_FUSE_DAX))
 		fuse_dax_inode_init(inode, flags);
