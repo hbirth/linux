@@ -7,6 +7,7 @@
 */
 
 #include "fuse_i.h"
+#include "fuse_dlm_cache.h"
 #include "dev_uring_i.h"
 
 #include <linux/pagemap.h>
@@ -183,6 +184,7 @@ static void fuse_evict_inode(struct inode *inode)
 	if (S_ISREG(inode->i_mode) && !fuse_is_bad(inode)) {
 		WARN_ON(!list_empty(&fi->write_files));
 		WARN_ON(!list_empty(&fi->queued_writes));
+		fuse_dlm_cache_release_locks(fi);
 	}
 }
 
@@ -544,6 +546,45 @@ struct inode *fuse_ilookup(struct fuse_conn *fc, u64 nodeid,
 	return NULL;
 }
 
+static void fuse_prune_aliases(struct inode *inode)
+{
+	struct dentry *dentry;
+
+	spin_lock(&inode->i_lock);
+	hlist_for_each_entry(dentry, &inode->i_dentry, d_u.d_alias) {
+		fuse_invalidate_entry_cache(dentry);
+	}
+	spin_unlock(&inode->i_lock);
+
+	d_prune_aliases(inode);
+}
+
+static void fuse_invalidate_inode_entry(struct inode *inode)
+{
+	struct dentry *dentry;
+
+	if (S_ISDIR(inode->i_mode)) {
+		/* For directories, use d_invalidate to handle children and submounts */
+		dentry = d_find_alias(inode);
+		if (dentry) {
+			d_invalidate(dentry);
+			fuse_invalidate_entry_cache(dentry);
+			dput(dentry);
+		}
+	} else {
+		/* For regular files, just unhash the dentry */
+		spin_lock(&inode->i_lock);
+		hlist_for_each_entry(dentry, &inode->i_dentry, d_u.d_alias) {
+			spin_lock(&dentry->d_lock);
+			if (!d_unhashed(dentry))
+				__d_drop(dentry);
+			spin_unlock(&dentry->d_lock);
+			fuse_invalidate_entry_cache(dentry);
+		}
+		spin_unlock(&inode->i_lock);
+	}
+}
+
 int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			     loff_t offset, loff_t len)
 {
@@ -561,6 +602,11 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 	fi->attr_version = atomic64_inc_return(&fc->attr_version);
 	spin_unlock(&fi->lock);
 
+	if (fc->inval_inode_entries)
+		fuse_invalidate_inode_entry(inode);
+	else if (fc->expire_inode_entries)
+		fuse_prune_aliases(inode);
+
 	fuse_invalidate_attr(inode);
 	forget_all_cached_acls(inode);
 	if (offset >= 0) {
@@ -569,6 +615,14 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			pg_end = -1;
 		else
 			pg_end = (offset + len - 1) >> PAGE_SHIFT;
+
+		if (fc->dlm && fc->writeback_cache)
+			/* invalidate the range from the beginning of the first page
+			 * in the given range to the last byte of the last page */
+			fuse_dlm_unlock_range(fi,
+								pg_start << PAGE_SHIFT,
+								(pg_end << PAGE_SHIFT) | (PAGE_SIZE - 1));
+
 		invalidate_inode_pages2_range(inode->i_mapping,
 					      pg_start, pg_end);
 	}
@@ -973,6 +1027,7 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 	fc->blocked = 0;
 	fc->initialized = 0;
 	fc->connected = 1;
+	fc->dlm = 1;
 	atomic64_set(&fc->attr_version, 1);
 	atomic64_set(&fc->evict_ctr, 1);
 	get_random_bytes(&fc->scramble_key, sizeof(fc->scramble_key));
@@ -1366,6 +1421,10 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 				fc->io_uring = 1;
 			if (flags & FUSE_NO_EXPORT_SUPPORT)
 				fm->sb->s_export_op = &fuse_export_fid_operations;
+			if (flags & FUSE_INVAL_INODE_ENTRY)
+				fc->inval_inode_entries = 1;
+			if (flags & FUSE_EXPIRE_INODE_ENTRY)
+				fc->expire_inode_entries = 1;
 		} else {
 			ra_pages = fc->max_read / PAGE_SIZE;
 			fc->no_lock = 1;
@@ -1416,7 +1475,7 @@ void fuse_send_init(struct fuse_mount *fm)
 		FUSE_HANDLE_KILLPRIV_V2 | FUSE_SETXATTR_EXT | FUSE_INIT_EXT |
 		FUSE_SECURITY_CTX | FUSE_CREATE_SUPP_GROUP |
 		FUSE_HAS_EXPIRE_ONLY | FUSE_DIRECT_IO_ALLOW_MMAP |
-		FUSE_NO_EXPORT_SUPPORT;
+		FUSE_NO_EXPORT_SUPPORT | FUSE_INVAL_INODE_ENTRY | FUSE_EXPIRE_INODE_ENTRY;
 #ifdef CONFIG_FUSE_DAX
 	if (fm->fc->dax)
 		flags |= FUSE_MAP_ALIGNMENT;
@@ -1965,6 +2024,7 @@ void fuse_conn_destroy(struct fuse_mount *fm)
 {
 	struct fuse_conn *fc = fm->fc;
 
+	fuse_flush_requests(fc, 30 * HZ);
 	if (fc->destroy)
 		fuse_send_destroy(fm);
 
