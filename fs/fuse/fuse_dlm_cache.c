@@ -376,6 +376,11 @@ int fuse_dlm_unlock_range(struct fuse_inode *inode,
 	if (!cache)
 		return -EINVAL;
 
+	if (start == 0 && end <= 0) {
+		fuse_dlm_cache_release_locks(inode);
+		return 0;
+	}
+
 	down_write(&cache->lock);
 
 	/* Find all ranges that overlap with [start, end] */

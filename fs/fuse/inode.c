@@ -617,6 +617,7 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			 * in the given range to the last byte of the last page */
 			fuse_dlm_unlock_range(fi,
 								pg_start << PAGE_SHIFT,
+								pg_end == -1 ? -1 :
 								(pg_end << PAGE_SHIFT) | (PAGE_SIZE - 1));
 
 		invalidate_inode_pages2_range(inode->i_mapping,
