@@ -1747,9 +1747,10 @@ static void fuse_writepage_finish(struct fuse_writepage_args *wpa)
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	int i;
 
-	for (i = 0; i < ap->num_pages; i++) {
-		fuse_writepage_finish_stat(inode, ap->pages[i]);
+    for (i = 0; i < ap->num_pages; i++) {
+        dec_wb_stat(&bdi->wb, WB_WRITEBACK);
 		end_page_writeback(ap->pages[i]);
+        wb_writeout_inc(&bdi->wb);
     }
 
 	wake_up(&fi->page_waitq);
@@ -1796,7 +1797,7 @@ __acquires(fi->lock)
 
  out_free:
 	fi->writectr--;
-	fuse_writepage_finish(wpa);
+	fuse_writepage_finish(fm, wpa);
 	spin_unlock(&fi->lock);
 	fuse_writepage_free(wpa);
 	spin_lock(&fi->lock);
@@ -2127,13 +2128,19 @@ static int fuse_writepages_fill(struct folio *folio,
 
 	if (data->wpa == NULL) {
 		err = -ENOMEM;
-		wpa = fuse_writepage_args_setup(folio, data->ff);
+		wpa = fuse_writepage_args_alloc();
 		if (!wpa)
 			goto out_unlock;
-		fuse_file_get(wpa->ia.ff);
+		fuse_writepage_add_to_bucket(fc, wpa);
 
 		data->max_pages = 1;
 		ap = &wpa->ia.ap;
+		fuse_write_args_fill(&wpa->ia, data->ff, folio_pos(folio), 0);
+		wpa->ia.write.in.write_flags |= FUSE_WRITE_CACHE;
+		wpa->inode = inode;
+		wpa->ia.ff = data->ff;
+		ap->args.in_pages = true;
+		ap->args.end = fuse_writepage_end;
 		ap->num_pages = 0;
 	}
 	folio_start_writeback(folio);
@@ -2141,6 +2148,7 @@ static int fuse_writepages_fill(struct folio *folio,
 	ap->descs[ap->num_pages].length = PAGE_SIZE;
 	ap->pages[ap->num_pages] = &folio->page;
 	ap->num_pages++;
+
 	inc_wb_stat(&inode_to_bdi(inode)->wb, WB_WRITEBACK);
 
 	err = 0;
