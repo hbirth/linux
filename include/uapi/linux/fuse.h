@@ -664,6 +664,13 @@ enum fuse_opcode {
 	FUSE_STATX		= 52,
 	FUSE_COPY_FILE_RANGE_64	= 53,
 
+	/* A compound request works like multiple simple requests.
+	 * This is a special case for calls that can be combined atomic on the
+	 * fuse server. If the server actually does atomically execute the command is
+	 * left to the fuse server implementation.
+	 */
+	FUSE_COMPOUND		= 101,
+
 	/* CUSE specific operations */
 	CUSE_INIT		= 4096,
 
@@ -1244,6 +1251,44 @@ struct fuse_supp_groups {
 	uint32_t	nr_groups;
 	uint32_t	groups[];
 };
+/*
+ * Compound request header
+ *
+ * This header is followed by the fuse requests
+ */
+struct fuse_compound_in {
+	uint32_t	count;			/* Number of operations */
+	uint32_t	flags;			/* Compound flags */
+
+	/* Total size of all results.
+	 * This is needed for preallocating the whole result for all
+	 * commands in this compound.
+	 */
+	uint32_t	result_size;
+	uint32_t	external_payload_size; /* unused for now */
+	uint64_t	reserved;
+};
+
+/*
+ * Compound response header
+ *
+ * This header is followed by complete fuse responses
+ */
+struct fuse_compound_out {
+	uint32_t	count;     /* Number of results */
+	uint32_t	flags;     /* Result flags */
+	uint32_t	external_payload_size; /* unused for now */
+	uint32_t	reserved;
+};
+
+/* Compound flags
+ * When the ocasion arises, we can add more flags for signalling
+ * different semantics like 'atomic' or 'continue on error'.
+ */
+#define FUSE_COMPOUND_ORDERED   (1 << 0)  /* Operations must be sequential */
+
+#define FUSE_MAX_COMPOUND_OPS   16        /* Maximum operations per compound */
+
 
 /**
  * Size of the ring buffer header
