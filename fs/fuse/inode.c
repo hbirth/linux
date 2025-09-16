@@ -1027,6 +1027,12 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 	fc->initialized = 0;
 	fc->connected = 1;
 	fc->dlm = 1;
+
+	/* pretend fuse server supports compound operations
+	 * until it tells us otherwise.
+	 */
+	fc->compound_ops = 1;
+
 	atomic64_set(&fc->attr_version, 1);
 	atomic64_set(&fc->evict_ctr, 1);
 	get_random_bytes(&fc->scramble_key, sizeof(fc->scramble_key));
@@ -1483,7 +1489,8 @@ void fuse_send_init(struct fuse_mount *fm)
 		FUSE_HANDLE_KILLPRIV_V2 | FUSE_SETXATTR_EXT | FUSE_INIT_EXT |
 		FUSE_SECURITY_CTX | FUSE_CREATE_SUPP_GROUP |
 		FUSE_HAS_EXPIRE_ONLY | FUSE_DIRECT_IO_ALLOW_MMAP |
-		FUSE_NO_EXPORT_SUPPORT | FUSE_INVAL_INODE_ENTRY | FUSE_EXPIRE_INODE_ENTRY;
+		FUSE_NO_EXPORT_SUPPORT |
+		FUSE_INVAL_INODE_ENTRY | FUSE_EXPIRE_INODE_ENTRY;
 #ifdef CONFIG_FUSE_DAX
 	if (fm->fc->dax)
 		flags |= FUSE_MAP_ALIGNMENT;
