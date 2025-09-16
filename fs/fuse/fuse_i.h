@@ -910,6 +910,9 @@ struct fuse_conn {
 	/* Use io_uring for communication */
 	unsigned int io_uring;
 
+	/* Does the filesystem support compound operations? */
+	unsigned int compound_ops:1;
+
 	/** Maximum stack depth for passthrough backing files */
 	int max_stack_depth;
 
@@ -1257,8 +1260,44 @@ static inline ssize_t fuse_simple_idmap_request(struct mnt_idmap *idmap,
 	return __fuse_simple_request(idmap, fm, args);
 }
 
+ssize_t __fuse_compound_request(struct mnt_idmap *idmap, struct fuse_mount *fm,
+			    struct fuse_args *args);
+
+static inline ssize_t fuse_compound_request(struct fuse_mount *fm,
+				struct fuse_args *args)
+{
+	return __fuse_compound_request(&invalid_mnt_idmap, fm, args);
+}
+
+static inline ssize_t fuse_compound_idmap_request(struct mnt_idmap *idmap,
+						struct fuse_mount *fm,
+						struct fuse_args *args)
+{
+	return __fuse_compound_request(idmap, fm, args);
+}
+
 int fuse_simple_background(struct fuse_mount *fm, struct fuse_args *args,
 			   gfp_t gfp_flags);
+
+/**
+ * Compound request API
+ */
+struct fuse_compound_req;
+
+struct fuse_compound_req *fuse_compound_alloc(struct fuse_mount *fm, uint32_t flags);
+int fuse_compound_add(struct fuse_compound_req *compound,
+		    struct fuse_args *args);
+void fuse_compound_free(struct fuse_compound_req *compound);
+ssize_t fuse_compound_idmap_send(struct mnt_idmap *idmap,
+			struct fuse_compound_req * compound);
+
+static inline ssize_t fuse_compound_send(struct fuse_compound_req *compound)
+{
+	return fuse_compound_idmap_send(&invalid_mnt_idmap, compound);
+}
+
+int fuse_compound_get_error(struct fuse_compound_req * compound,
+			    int op_idx);
 
 /**
  * Assign a unique id to a fuse request
@@ -1525,9 +1564,17 @@ void fuse_file_io_release(struct fuse_file *ff, struct inode *inode);
 
 /* file.c */
 struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
-				 unsigned int open_flags, bool isdir);
+								struct inode *inode,
+								unsigned int open_flags, bool isdir);
 void fuse_file_release(struct inode *inode, struct fuse_file *ff,
 		       unsigned int open_flags, fl_owner_t id, bool isdir);
+#ifdef CONFIG_MIGRATION
+int fuse_migrate_folio(struct address_space *mapping, struct folio *dst,
+		struct folio *src, enum migrate_mode mode);
+#else
+#define fuse_migrate_folio NULL
+#endif
+
 
 /* backing.c */
 #ifdef CONFIG_FUSE_PASSTHROUGH
