@@ -98,11 +98,25 @@ struct fuse_ring_queue {
 	/* background fuse requests */
 	struct list_head fuse_req_bg_queue;
 
+	/* number of requests queued or in userspace */
+	unsigned int nr_reqs;
+
 	struct fuse_pqueue fpq;
 
 	unsigned int active_background;
 
 	bool stopped;
+};
+
+struct fuse_queue_map {
+	/* Tracks which queues are registered */
+	cpumask_var_t registered_q_mask;
+
+	/* number of registered queues */
+	size_t nr_queues;
+
+	/* cpu to qid mapping */
+	int *cpu_to_qid;
 };
 
 /**
@@ -114,7 +128,10 @@ struct fuse_ring {
 	struct fuse_conn *fc;
 
 	/* number of ring queues */
-	size_t nr_queues;
+	size_t max_nr_queues;
+
+	/* number of numa nodes */
+	int nr_numa_nodes;
 
 	/* maximum payload/arg size */
 	size_t max_payload_sz;
@@ -125,6 +142,12 @@ struct fuse_ring {
 	 * Log ring entry states on stop when entries cannot be released
 	 */
 	unsigned int stop_debug_log : 1;
+
+	/* per numa node queue tracking */
+	struct fuse_queue_map *numa_q_map;
+
+	/* all queue tracking */
+	struct fuse_queue_map q_map;
 
 	wait_queue_head_t stop_waitq;
 
