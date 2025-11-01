@@ -210,7 +210,7 @@ struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
 		struct fuse_open_out *outargp = &ff->args->open_outarg;
 		int err = -ENOSYS;
 
-		if (inode && fc->compound_ops) {
+		if (inode && fc->compound_open_getattr) {
 			struct fuse_attr_out attr_outarg;
 			err = fuse_compound_open_getattr(fm, nodeid, open_flags,
 							opcode, ff, outargp, &attr_outarg);

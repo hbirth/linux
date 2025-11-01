@@ -911,7 +911,8 @@ struct fuse_conn {
 	unsigned int io_uring;
 
 	/* Does the filesystem support compound operations? */
-	unsigned int compound_ops:1;
+	unsigned int compound_open_getattr:1;
+	unsigned int compound_lookup_create:1;
 
 	/** Maximum stack depth for passthrough backing files */
 	int max_stack_depth;

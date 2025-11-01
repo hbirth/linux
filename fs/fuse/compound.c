@@ -399,9 +399,6 @@ ssize_t fuse_compound_idmap_send(struct mnt_idmap *idmap,
 		.out_argvar = true,
 	};
 
-	if (!compound->fm->fc->compound_ops)
-		return -ENOSYS;
-
 	if (!compound || compound->compound_header.count == 0)
 		return -EINVAL;
 
@@ -437,7 +434,6 @@ ssize_t fuse_compound_idmap_send(struct mnt_idmap *idmap,
 
 	ret = fuse_compound_idmap_request(idmap, compound->fm, &args);
 	if (ret == -ENOSYS) {
-		compound->fm->fc->compound_ops = false;
 		goto out;
 	}
 
