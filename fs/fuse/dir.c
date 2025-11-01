@@ -8,6 +8,7 @@
 
 #include "fuse_i.h"
 
+#include <linux/fuse.h>
 #include <linux/pagemap.h>
 #include <linux/file.h>
 #include <linux/fs_context.h>
@@ -731,17 +732,232 @@ out_err:
 }
 
 static int fuse_mknod(struct mnt_idmap *, struct inode *, struct dentry *,
-		      umode_t, dev_t);
+			umode_t, dev_t);
+
+static int fuse_compound_lookup_create(struct mnt_idmap *idmap, struct inode *dir,
+			struct dentry *entry, struct file *file,
+			unsigned flags, umode_t mode)
+{
+	int epoch, err;
+	struct inode *inode;
+	struct fuse_mount *fm = get_fuse_mount(dir);
+	struct fuse_conn *fc = fm->fc;
+	struct fuse_forget_link *forget;
+	struct fuse_create_in create_inarg;
+	struct fuse_entry_out lookup_outentry;
+	struct fuse_open_out outopen;
+	struct fuse_entry_out outentry;
+	struct fuse_inode *fi;
+	struct fuse_file *ff;
+	struct fuse_in_arg security_ext = { .size = 0, .value = NULL };
+	FUSE_ARGS(lookup_args);
+	FUSE_ARGS(create_args);
+	bool trunc = flags & O_TRUNC;
+	bool locked = false;
+
+	if (!(flags & O_CREAT)) {
+		/* we're not supposed to create anything */
+
+		if (d_in_lookup(entry)) {
+			struct dentry *res = fuse_lookup(dir, entry, 0);
+			if (res || d_really_is_positive(entry))
+				return finish_no_open(file, res);
+		}
+
+		return finish_no_open(file, NULL);
+	}
+
+	struct fuse_compound_req *compound =
+		fuse_compound_alloc(fm,
+			FUSE_COMPOUND_CONTINUE | FUSE_COMPOUND_ORDERED |
+			FUSE_COMPOUND_ATOMIC);
+
+	epoch = atomic_read(&fm->fc->epoch);
+
+	if (!fc->dont_mask)
+		mode &= ~current_umask();
+
+	flags &= ~O_NOCTTY;
+	memset(&lookup_outentry, 0, sizeof(lookup_outentry));
+	memset(&create_inarg, 0, sizeof(create_inarg));
+	memset(&outentry, 0, sizeof(outentry));
+
+	if (fc->handle_killpriv_v2 && (flags & O_TRUNC) &&
+	    !(flags & O_EXCL) && !capable(CAP_FSETID)) {
+		create_inarg.open_flags |= FUSE_OPEN_KILL_SUIDGID;
+	}
+
+	fuse_lookup_init(fm->fc, &lookup_args,
+			get_node_id(dir), &entry->d_name, &lookup_outentry);
+	err = fuse_compound_add(compound, &lookup_args);
+	if (err)
+		goto out_unlock;
+
+
+	/* Only creates */
+	file->f_mode |= FMODE_CREATED;
+
+	create_inarg.flags = flags;
+	create_inarg.mode = mode;
+	create_inarg.umask = current_umask();
+
+	create_args.opcode = FUSE_CREATE;
+	create_args.nodeid = get_node_id(dir);
+	create_args.in_numargs = 2;
+
+	create_args.in_args[0].size = sizeof(create_inarg);
+	create_args.in_args[0].value = &create_inarg;
+	create_args.in_args[1].size = entry->d_name.len + 1;
+	create_args.in_args[1].value = entry->d_name.name;
+	create_args.out_numargs = 2;
+	create_args.out_args[0].size = sizeof(outentry);
+	create_args.out_args[0].value = &outentry;
+	create_args.out_args[1].size = sizeof(outopen);
+	create_args.out_args[1].value = &outopen;
+
+	err = get_create_ext(idmap, &create_args, dir, entry, mode);
+	if (err)
+		goto out_unlock;
+
+	if (fc->init_security) {
+		err = get_security_context(entry, mode, &security_ext);
+		if (err)
+			goto out_unlock;
+
+		if (security_ext.size) {
+			create_args.in_numargs = 3;
+			create_args.in_args[2] = security_ext;
+		}
+	}
+
+	err = fuse_compound_add(compound, &create_args);
+	if (err)
+		goto out_unlock;
+
+	printk("fuse_compound_lookup_create: sending compound request\n");
+	err = fuse_compound_idmap_send(idmap, compound);
+	printk("fuse_compound_lookup_create: compound returned %d\n", err);
+	fuse_unlock_inode(dir, locked);
+	locked = false;  /* Mark as unlocked to avoid double unlock */
+	free_ext_value(&create_args);
+
+	if (err)
+		goto out_err;
+
+	forget = fuse_alloc_forget();
+	if (!forget) {
+		err = -ENOMEM;
+		goto out_err;
+	}
+
+	ff = fuse_file_alloc(fm, true);
+	if (!ff) {
+		err = -ENOMEM;
+		goto out_put_forget_req;
+	}
+
+	if (!S_ISREG(outentry.attr.mode) || invalid_nodeid(outentry.nodeid) ||
+		fuse_invalid_attr(&outentry.attr))
+			goto out_free_ff;
+
+	ff->fh = outopen.fh;
+	ff->nodeid = outentry.nodeid;
+	ff->open_flags = outopen.open_flags;
+	inode = fuse_iget(dir->i_sb, outentry.nodeid, outentry.generation,
+			  &outentry.attr, ATTR_TIMEOUT(&outentry),
+			  fuse_get_attr_version(fc), fuse_get_evict_ctr(fc));
+	if (!inode) {
+		flags &= ~(O_CREAT | O_EXCL | O_TRUNC);
+		fuse_sync_release(NULL, ff, flags);
+		fuse_queue_forget(fm->fc, forget, outentry.nodeid, 1);
+		err = -ENOMEM;
+		goto out_free_ff;
+	}
+
+	kfree(forget);
+	printk("fuse_compound_lookup_create: about to splice alias dentry %p, inode %p, d_in_lookup=%d, d_unhashed=%d\n",
+	       entry, inode, d_in_lookup(entry), d_unhashed(entry));
+
+	/* Drop the dentry before splicing, as required by d_splice_alias */
+	d_drop(entry);
+	printk("fuse_compound_lookup_create: after d_drop, d_unhashed=%d\n", d_unhashed(entry));
+
+	{
+		struct dentry *alias = d_splice_alias(inode, entry);
+		if (IS_ERR(alias)) {
+			err = PTR_ERR(alias);
+			goto out_free_ff;
+		}
+		if (alias) {
+			/* d_splice_alias returned a different dentry */
+			printk("fuse_compound_lookup_create: d_splice_alias returned different dentry %p\n", alias);
+			dput(alias);
+		}
+	}
+	printk("fuse_compound_lookup_create: final entry=%p\n", entry);
+	entry->d_time = epoch;
+	fuse_change_entry_timeout(entry, &outentry);
+	fuse_dir_changed(dir);
+	printk("fuse_compound_lookup_create: about to call generic_file_open with entry=%p\n", entry);
+	err = generic_file_open(inode, file);
+	if (!err) {
+		file->private_data = ff;
+		printk("fuse_compound_lookup_create: about to call finish_open with entry=%p (d_name=%s)\n", entry, entry->d_name.name);
+		printk("fuse_compound_lookup_create: entry->d_inode=%p, entry->d_flags=0x%x\n", entry->d_inode, entry->d_flags);
+		printk("fuse_compound_lookup_create: file=%p, file->f_path.dentry=%p\n", file, file->f_path.dentry);
+		err = finish_open(file, entry, fuse_finish_open);
+		printk("fuse_compound_lookup_create: finish_open returned %d\n", err);
+		printk("fuse_compound_lookup_create: after finish_open, file->f_path.dentry=%p\n", file->f_path.dentry);
+	}
+	if (err) {
+		fi = get_fuse_inode(inode);
+		fuse_sync_release(fi, ff, flags);
+	} else {
+		if (fm->fc->atomic_o_trunc && trunc)
+			truncate_pagecache(inode, 0);
+		else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
+			invalidate_inode_pages2(inode->i_mapping);
+	}
+
+	fuse_compound_free(compound);
+	return err;
+
+out_free_ff:
+	fuse_file_free(ff);
+out_put_forget_req:
+	kfree(forget);
+out_unlock:
+	if (locked)
+		fuse_unlock_inode(dir, locked);
+	free_ext_value(&create_args);
+out_err:
+	fuse_compound_free(compound);
+	return err;
+}
+
 static int fuse_atomic_open(struct inode *dir, struct dentry *entry,
 			    struct file *file, unsigned flags,
 			    umode_t mode)
 {
-	int err;
+	int err = -ENOSYS;
 	struct mnt_idmap *idmap = file_mnt_idmap(file);
 	struct fuse_conn *fc = get_fuse_conn(dir);
 
 	if (fuse_is_bad(dir))
 		return -EIO;
+
+	printk("atomic open %s\n", entry->d_name.name);
+	printk("fuse_atomic_open: file=%p, file->f_path.dentry=%p, file->f_path.mnt=%p\n",
+	       file, file->f_path.dentry, file->f_path.mnt);
+
+	err = fuse_compound_lookup_create(idmap, dir,
+					entry, file, flags, mode);
+	printk("fuse_atomic_open: compound returned %d, file->f_path.dentry=%p, file->f_path.mnt=%p\n",
+	       err, file->f_path.dentry, file->f_path.mnt);
+	if (err != -ENOSYS)
+		return err;
+
+	printk("old atomic open %s\n", entry->d_name.name);
 
 	if (d_in_lookup(entry)) {
 		struct dentry *res = fuse_lookup(dir, entry, 0);

@@ -392,6 +392,7 @@ struct fuse_file_lock {
 #define FOPEN_NOFLUSH		(1 << 5)
 #define FOPEN_PARALLEL_DIRECT_WRITES	(1 << 6)
 #define FOPEN_PASSTHROUGH	(1 << 7)
+#define FOPEN_FILE_CREATED	(1 << 8)
 
 /**
  * INIT request/reply flags
@@ -1283,9 +1284,11 @@ struct fuse_compound_out {
 
 /* Compound flags
  * When the ocasion arises, we can add more flags for signalling
- * different semantics like 'atomic' or 'continue on error'.
+ * different semantics.
  */
-#define FUSE_COMPOUND_ORDERED   (1 << 0)  /* Operations must be sequential */
+#define FUSE_COMPOUND_ORDERED	(1 << 0)  /* Operations must be sequential */
+#define FUSE_COMPOUND_ATOMIC	(1 << 1)  /* Operations must be atomic */
+#define FUSE_COMPOUND_CONTINUE	(1 << 2)  /* Continue on error */
 
 #define FUSE_MAX_COMPOUND_OPS   16        /* Maximum operations per compound */
 
