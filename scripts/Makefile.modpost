@@ -130,7 +130,14 @@ endif
 quiet_cmd_modpost = MODPOST $@
       cmd_modpost = sed 's/\.ko$$/$(mod-prelink-ext)\.o/' $< | $(MODPOST) -T -
 
-$(output-symdump): $(MODORDER) $(input-symdump) $(modules:.ko=$(mod-prelink-ext).o) FORCE
+# Create .prelink.mod files for modpost to find
+quiet_cmd_prelink_mod = GEN     $@
+      cmd_prelink_mod = cp $(patsubst %.prelink.mod,%.mod,$@) $@
+
+$(modules:.ko=$(mod-prelink-ext).mod): %$(mod-prelink-ext).mod: %.mod
+	$(call if_changed,prelink_mod)
+
+$(output-symdump): $(MODORDER) $(input-symdump) $(modules:.ko=$(mod-prelink-ext).o) $(modules:.ko=$(mod-prelink-ext).mod) FORCE
 	$(call if_changed,modpost)
 
 targets += $(output-symdump)
