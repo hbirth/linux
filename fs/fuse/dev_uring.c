@@ -14,7 +14,7 @@
 
 static bool __read_mostly enable_uring;
 module_param(enable_uring, bool, 0644);
-MODULE_PARM_DESC(enable_uring_dangerous,
+MODULE_PARM_DESC(enable_uring,
 		 "Enable userspace communication through io-uring");
 
 #define FUSE_URING_IOV_SEGS 2 /* header and payload */
@@ -163,6 +163,23 @@ void fuse_uring_destruct(struct fuse_conn *fc)
 	if (!ring)
 		return;
 
+	/* Cleanup daemon monitoring */
+	if (ring->daemon_pid) {
+		struct pid *pid;
+
+		/*
+		 * Atomically clear daemon_pid. If callback runs concurrently,
+		 * only one of us (callback or destruct) will see non-NULL.
+		 */
+		pid = xchg(&ring->daemon_pid, NULL);
+		if (pid) {
+			remove_wait_queue(&pid->wait_pidfd,
+					  &ring->daemon_exit_wait);
+			put_pid(pid);
+			fuse_conn_put(ring->fc);
+		}
+	}
+
 	for (qid = 0; qid < ring->nr_queues; qid++) {
 		struct fuse_ring_queue *queue = ring->queues[qid];
 		struct fuse_ring_ent *ent, *next;
@@ -189,6 +206,59 @@ void fuse_uring_destruct(struct fuse_conn *fc)
 	kfree(ring->queues);
 	kfree(ring);
 	fc->ring = NULL;
+}
+
+static int fuse_daemon_exit_callback(wait_queue_entry_t *wait, unsigned mode,
+				      int sync, void *key)
+{
+	struct fuse_ring *ring =
+		container_of(wait, struct fuse_ring, daemon_exit_wait);
+	struct pid *pid;
+
+	/*
+	 * Atomically clear daemon_pid. If already NULL, fuse_uring_destruct()
+	 * won the race and we must not access ring->fc (might be freed).
+	 */
+	pid = xchg(&ring->daemon_pid, NULL);
+	if (!pid)
+		return 0;
+
+	/* Daemon is exiting - abort connection and drop reference */
+	fuse_abort_conn(ring->fc);
+	fuse_conn_put(ring->fc);
+	put_pid(pid);
+
+	return 0;
+}
+
+/* During daemon registration */
+static int fuse_register_daemon(struct fuse_ring *ring)
+{
+	struct pid *pid;
+
+	pid = get_task_pid(current, PIDTYPE_TGID);
+	if (!pid)
+		return -ESRCH;
+
+	/*
+	 * Take reference on fc. Dropped by either:
+	 * - Callback when daemon exits, or
+	 * - fuse_uring_destruct() if callback hasn't run
+	 */
+	fuse_conn_get(ring->fc);
+
+	ring->daemon_pid = pid;
+
+	/* Setup wait queue entry */
+	ring->daemon_exit_wait.flags = 0;
+	ring->daemon_exit_wait.private = NULL;
+	ring->daemon_exit_wait.func = fuse_daemon_exit_callback;
+	INIT_LIST_HEAD(&ring->daemon_exit_wait.entry);
+
+	/* Add to pid's wait queue - woken when process exits */
+	add_wait_queue(&pid->wait_pidfd, &ring->daemon_exit_wait);
+
+	return 0;
 }
 
 /*
@@ -228,6 +298,8 @@ static struct fuse_ring *fuse_uring_create(struct fuse_conn *fc)
 	ring->fc = fc;
 	ring->max_payload_sz = max_payload_size;
 	atomic_set(&ring->queue_refs, 0);
+
+	fuse_register_daemon(ring);
 
 	spin_unlock(&fc->lock);
 	return ring;

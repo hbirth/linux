@@ -132,6 +132,9 @@ struct fuse_ring {
 
 	atomic_t queue_refs;
 
+	struct pid *daemon_pid;
+	wait_queue_entry_t daemon_exit_wait;
+
 	bool ready;
 };
 
