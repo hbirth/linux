@@ -251,19 +251,19 @@ struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
 							 &attr_outarg, outargp);
 			if (err == -ENOSYS)
 				fc->compound_open_getattr = 0;
-                        if (!err)
+			if (!err)
 				fuse_change_attributes(inode, &attr_outarg.attr,
-					NULL,
-					ATTR_TIMEOUT(&attr_outarg),
-					fuse_get_attr_version(fc));
-                }
-                if (err == -ENOSYS) {
+						       NULL,
+						       ATTR_TIMEOUT(&attr_outarg),
+						       fuse_get_attr_version(fc));
+		}
+		if (err == -ENOSYS) {
 			err = fuse_send_open(fm, nodeid, open_flags, opcode, outargp);
-                        if (!err) {
+			if (!err) {
 				ff->fh = outargp->fh;
 				ff->open_flags = outargp->open_flags;
-                        }
-                }
+			}
+		}
 
 		if (err) {
 			if (err != -ENOSYS) {

@@ -1029,7 +1029,6 @@ struct fuse_conn {
 	/* Use io_uring for communication */
 	unsigned int io_uring;
 
-
 	/* Does the filesystem support compound operations? */
 	unsigned int compound_open_getattr:1;
 	/** Maximum stack depth for passthrough backing files */
