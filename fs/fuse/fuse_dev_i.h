@@ -81,11 +81,14 @@ void fuse_dev_end_requests(struct list_head *head);
 void fuse_copy_init(struct fuse_copy_state *cs, bool write,
 			   struct iov_iter *iter);
 void fuse_copy_finish(struct fuse_copy_state *cs);
+int fuse_copy_one(struct fuse_copy_state *cs, void *val, unsigned size);
 int fuse_copy_args(struct fuse_copy_state *cs, unsigned int numargs,
 		   unsigned int argpages, struct fuse_arg *args,
 		   int zeroing);
 int fuse_copy_out_args(struct fuse_copy_state *cs, struct fuse_args *args,
 		       unsigned int nbytes);
+int fuse_copy_compound_out_args(struct fuse_copy_state *cs,
+				struct fuse_compound_args *compound);
 void fuse_dev_queue_forget(struct fuse_iqueue *fiq,
 			   struct fuse_forget_link *forget);
 void fuse_dev_queue_interrupt(struct fuse_iqueue *fiq, struct fuse_req *req);

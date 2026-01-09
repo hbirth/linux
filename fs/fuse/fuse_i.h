@@ -345,7 +345,13 @@ struct fuse_args {
 	bool is_ext:1;
 	bool is_pinned:1;
 	bool invalidate_vmap:1;
+
 	bool abort_on_kill:1;
+	/* in case this is a subrequest in a compound */
+	bool is_sub_entry:1;
+	bool is_sub_dep:1;
+	bool is_sub_optional:1;
+
 	struct fuse_in_arg in_args[4];
 	struct fuse_arg out_args[2];
 	void (*end)(struct fuse_mount *fm, struct fuse_args *args, int error);
@@ -911,6 +917,9 @@ struct fuse_conn {
 	/** Passthrough support for read/write IO */
 	unsigned int passthrough:1;
 
+	/* does fuse server support compound operations? */
+	unsigned int compound_ops:1;
+
 	/* Use pages instead of pointer for kernel I/O */
 	unsigned int use_pages_for_kvec_io:1;
 
@@ -1271,6 +1280,41 @@ static inline ssize_t fuse_simple_idmap_request(struct mnt_idmap *idmap,
 
 int fuse_simple_background(struct fuse_mount *fm, struct fuse_args *args,
 			   gfp_t gfp_flags);
+
+struct fuse_compound_arg {
+	struct fuse_args *arg;
+	int *error;
+	struct fuse_compound_req_in *req;
+};
+
+/*
+ * Extended fuse_args for compound requests.
+ * Similar to fuse_args_pages, this embeds fuse_args as the first member
+ * so the device layer can use container_of to access the operation array.
+ */
+struct fuse_compound_args {
+	struct fuse_args args;
+	struct fuse_compound_arg *ops;
+	unsigned int count;
+	struct fuse_compound_in in_header;
+	struct fuse_compound_out out_header;
+};
+
+/**
+ * Calculate the total size of a compound request including all sub-operations.
+ */
+size_t fuse_compound_req_size(struct fuse_compound_args *compound);
+
+/**
+ * Send a compound request - similar to fuse_simple_request but allows
+ * the device layer to stream operations without pre-building a buffer
+ */
+ssize_t fuse_send_compound_request(struct mnt_idmap *idmap,
+				   struct fuse_mount *fm,
+				   struct fuse_compound_args *compound_args);
+
+ssize_t fuse_compound_send(struct fuse_mount *fm, struct fuse_compound_arg *arg,
+			   unsigned int count);
 
 /**
  * Assign a unique id to a fuse request

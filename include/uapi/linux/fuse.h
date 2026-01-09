@@ -664,6 +664,13 @@ enum fuse_opcode {
 	FUSE_STATX		= 52,
 	FUSE_COPY_FILE_RANGE_64	= 53,
 
+	/* A compound request is handled like a single request,
+	 * but contains multiple requests as input.
+	 * This can be used to signal to the fuse server that
+	 * the requests can be combined atomically.
+	 */
+	FUSE_COMPOUND		= 54,
+
 	/* CUSE specific operations */
 	CUSE_INIT		= 4096,
 
@@ -1243,6 +1250,45 @@ struct fuse_ext_header {
 struct fuse_supp_groups {
 	uint32_t	nr_groups;
 	uint32_t	groups[];
+};
+
+/*
+ * Compound request header
+ *
+ * This header is followed by the fuse requests
+ */
+struct fuse_compound_in {
+	uint64_t	reserved[2];
+};
+
+/*
+ * this signals the subrequest consumes data from an earlier request
+ */
+#define FUSE_COMPOUND_SUB_IS_DEP (1 << 0)
+/*
+ * this signlas the subrequest produces data that will be used by a later
+ * subrequest
+ */
+#define FUSE_COMPOUND_SUB_IS_ENTRY (1 << 1)
+
+/*
+ * Header for each subrequest in a compound request
+ */
+struct fuse_compound_req_in {
+	uint8_t		flags;
+	/* which other operation this one depends on */
+	uint8_t		sub_dep_index;
+	uint16_t	padding;
+	uint32_t	reserved;
+};
+
+/*
+ * Compound response header
+ *
+ * This header is followed by complete fuse responses
+ */
+struct fuse_compound_out {
+	uint64_t	reserved[2];
 };
 
 /**

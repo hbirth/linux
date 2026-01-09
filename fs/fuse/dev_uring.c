@@ -595,7 +595,14 @@ static int fuse_uring_copy_from_ring(struct fuse_ring *ring,
 	cs.is_uring = true;
 	cs.req = req;
 
-	err = fuse_copy_out_args(&cs, args, ring_in_out.payload_sz);
+	if (args->opcode == FUSE_COMPOUND) {
+		/* Stream compound response directly into operation buffers */
+		struct fuse_compound_args *compound =
+			container_of(args, struct fuse_compound_args, args);
+		err = fuse_copy_compound_out_args(&cs, compound);
+	} else {
+		err = fuse_copy_out_args(&cs, args, ring_in_out.payload_sz);
+	}
 	fuse_copy_finish(&cs);
 	return err;
 }
@@ -627,31 +634,87 @@ static int fuse_uring_args_to_ring(struct fuse_ring *ring, struct fuse_req *req,
 	cs.is_uring = true;
 	cs.req = req;
 
-	if (num_args > 0) {
-		/*
-		 * Expectation is that the first argument is the per op header.
-		 * Some op code have that as zero size.
-		 */
+	if (args->opcode == FUSE_COMPOUND) {
+		/* Stream compound operations directly using container_of */
+		struct fuse_compound_args *compound =
+			container_of(args, struct fuse_compound_args, args);
+		unsigned int i, j;
+
+		/* First copy the compound header to op_in */
 		if (args->in_args[0].size > 0) {
-			err = copy_to_user(&ent->headers->op_in, in_args->value,
-					   in_args->size);
+			err = copy_to_user(&ent->headers->op_in, args->in_args[0].value,
+					   args->in_args[0].size);
 			if (err) {
-				pr_info_ratelimited(
-					"Copying the header failed.\n");
+				pr_info_ratelimited("Copying compound header failed.\n");
 				return -EFAULT;
 			}
 		}
-		in_args++;
-		num_args--;
-	}
 
-	/* copy the payload */
-	err = fuse_copy_args(&cs, num_args, args->in_pages,
-			     (struct fuse_arg *)in_args, 0);
-	fuse_copy_finish(&cs);
-	if (err) {
-		pr_info_ratelimited("%s fuse_copy_args failed\n", __func__);
-		return err;
+		/* Then stream each operation from the array */
+		for (i = 0; !err && i < compound->count; i++) {
+			struct fuse_compound_arg *op = &compound->ops[i];
+			struct fuse_args *op_args = op->arg;
+			struct fuse_in_header hdr;
+			size_t op_size = sizeof(struct fuse_in_header);
+
+			/* Copy compound request header for this operation */
+			err = fuse_copy_one(&cs, op->req,
+					    sizeof(struct fuse_compound_req_in));
+			if (err)
+				break;
+
+			/* Calculate operation size */
+			for (j = 0; j < op_args->in_numargs; j++)
+				op_size += op_args->in_args[j].size;
+
+			/* Build and copy fuse_in_header on the stack */
+			memset(&hdr, 0, sizeof(hdr));
+			hdr.unique = i;
+			hdr.len = op_size;
+			hdr.opcode = op_args->opcode;
+			hdr.nodeid = op_args->nodeid;
+
+			err = fuse_copy_one(&cs, &hdr, sizeof(hdr));
+			if (err)
+				break;
+
+			/* Copy operation arguments directly */
+			err = fuse_copy_args(&cs, op_args->in_numargs,
+					     op_args->in_pages,
+					     (struct fuse_arg *)op_args->in_args, 0);
+		}
+		fuse_copy_finish(&cs);
+		if (err) {
+			pr_info_ratelimited("%s compound streaming failed\n", __func__);
+			return err;
+		}
+	} else {
+		if (num_args > 0) {
+			/*
+			 * Expectation is that the first argument is the per op header.
+			 * Some op code have that as zero size.
+			 */
+			if (args->in_args[0].size > 0) {
+				err = copy_to_user(&ent->headers->op_in, in_args->value,
+						   in_args->size);
+				if (err) {
+					pr_info_ratelimited(
+						"Copying the header failed.\n");
+					return -EFAULT;
+				}
+			}
+			in_args++;
+			num_args--;
+		}
+
+		/* copy the payload */
+		err = fuse_copy_args(&cs, num_args, args->in_pages,
+				     (struct fuse_arg *)in_args, 0);
+		fuse_copy_finish(&cs);
+		if (err) {
+			pr_info_ratelimited("%s fuse_copy_args failed\n", __func__);
+			return err;
+		}
 	}
 
 	ent_in_out.payload_sz = cs.ring.copied_sz;
@@ -1271,6 +1334,17 @@ void fuse_uring_queue_fuse_req(struct fuse_iqueue *fiq, struct fuse_req *req)
 	queue = fuse_uring_task_to_queue(ring);
 	if (!queue)
 		goto err;
+
+	/* Set request length before assigning unique ID */
+	if (req->args->opcode == FUSE_COMPOUND) {
+		struct fuse_compound_args *compound =
+			container_of(req->args, struct fuse_compound_args, args);
+		req->in.h.len = fuse_compound_req_size(compound);
+	} else {
+		req->in.h.len = sizeof(struct fuse_in_header) +
+			fuse_len_args(req->args->in_numargs,
+				      (struct fuse_arg *) req->args->in_args);
+	}
 
 	fuse_request_assign_unique(fiq, req);
 
