@@ -210,7 +210,8 @@ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 
 	lockdep_assert_held(&fi->lock);
 
-	fi->attr_version = atomic64_inc_return(&fc->attr_version);
+	if (fi->attr_version != 1) /* fuse_iget() handle if attr_version == 1 */
+		fi->attr_version = atomic64_inc_return(&fc->attr_version);
 	fi->i_time = attr_valid;
 	/* Clear basic stats from invalid mask */
 	set_mask_bits(&fi->inval_mask, STATX_BASIC_STATS, 0);
@@ -421,6 +422,8 @@ static int fuse_inode_set(struct inode *inode, void *_nodeidp)
 	return 0;
 }
 
+int fuse_reverse_inval_inode_common(struct fuse_conn *fc, struct inode *inode,
+				    loff_t offset, loff_t len);
 struct inode *fuse_iget(struct super_block *sb, u64 nodeid,
 			int generation, struct fuse_attr *attr,
 			u64 attr_valid, u64 attr_version)
@@ -486,6 +489,13 @@ retry:
 done:
 	fuse_change_attributes(inode, attr, NULL, attr_valid, attr_version);
 
+	spin_lock(&fi->lock);
+	if (fi->attr_version == 1) {
+		spin_unlock(&fi->lock);
+		fuse_reverse_inval_inode_common(fc, inode, 0, 0);
+	} else
+		spin_unlock(&fi->lock);
+
 	return inode;
 }
 
@@ -550,20 +560,30 @@ static void fuse_invalidate_inode_entry(struct inode *inode)
 	}
 }
 
-int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
-			     loff_t offset, loff_t len)
+int fuse_reverse_inval_inode_common(struct fuse_conn *fc, struct inode *inode,
+				    loff_t offset, loff_t len)
 {
 	struct fuse_inode *fi;
-	struct inode *inode;
 	pgoff_t pg_start;
 	pgoff_t pg_end;
 
-	inode = fuse_ilookup(fc, nodeid, NULL);
-	if (!inode)
-		return -ENOENT;
-
 	fi = get_fuse_inode(inode);
 	spin_lock(&fi->lock);
+
+	if (fi->attr_version <= 1) {
+		/*
+		 * attr_version <= 1 indicate fuse_iget() is not completed yet.
+		 * Skip the inode invalidation operation here, and delay it in the
+		 * function fuse_iget(), after call to fuse_change_attributes().
+		 * Initialized value of fc->attr_version is 1, so fi->attr_version
+		 * will be 0 or >= 2, we use value 1 to indicate the "delayed"
+		 * inode invalidation operations been recorded
+		 */
+		fi->attr_version = 1;
+		spin_unlock(&fi->lock);
+		return 0;
+	}
+
 	fi->attr_version = atomic64_inc_return(&fc->attr_version);
 	spin_unlock(&fi->lock);
 
@@ -594,8 +614,22 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 		invalidate_inode_pages2_range(inode->i_mapping,
 					      pg_start, pg_end);
 	}
-	iput(inode);
 	return 0;
+}
+
+int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
+			     loff_t offset, loff_t len)
+{
+	struct inode *inode;
+	int ret;
+
+	inode = fuse_ilookup(fc, nodeid, NULL);
+	if (!inode)
+		return -ENOENT;
+
+	ret = fuse_reverse_inval_inode_common(fc, inode, offset, len);
+	iput(inode);
+	return ret;
 }
 
 bool fuse_lock_inode(struct inode *inode)
