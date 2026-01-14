@@ -896,9 +896,6 @@ struct fuse_conn {
 	/** Version counter for attribute changes */
 	atomic64_t attr_version;
 
-	/** Version counter for evict inode */
-	atomic64_t evict_ctr;
-
 	/* maximum file name length */
 	u32 name_max;
 
@@ -1013,11 +1010,6 @@ static inline u64 fuse_get_attr_version(struct fuse_conn *fc)
 	return atomic64_read(&fc->attr_version);
 }
 
-static inline u64 fuse_get_evict_ctr(struct fuse_conn *fc)
-{
-	return atomic64_read(&fc->evict_ctr);
-}
-
 static inline bool fuse_stale_inode(const struct inode *inode, int generation,
 				    struct fuse_attr *attr)
 {
@@ -1085,8 +1077,7 @@ extern const struct dentry_operations fuse_root_dentry_operations;
  */
 struct inode *fuse_iget(struct super_block *sb, u64 nodeid,
 			int generation, struct fuse_attr *attr,
-			u64 attr_valid, u64 attr_version,
-			u64 evict_ctr);
+			u64 attr_valid, u64 attr_version);
 
 int fuse_lookup_name(struct super_block *sb, u64 nodeid, const struct qstr *name,
 		     struct fuse_entry_out *outarg, struct inode **inode);
@@ -1184,8 +1175,7 @@ void fuse_change_attributes(struct inode *inode, struct fuse_attr *attr,
 
 void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 				   struct fuse_statx *sx,
-				   u64 attr_valid, u32 cache_mask,
-				   u64 evict_ctr);
+				   u64 attr_valid, u32 cache_mask);
 
 u32 fuse_get_cache_mask(struct inode *inode);
 

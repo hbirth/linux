@@ -149,7 +149,7 @@ static int parse_dirfile(char *buf, size_t nbytes, struct file *file,
 
 static int fuse_direntplus_link(struct file *file,
 				struct fuse_direntplus *direntplus,
-				u64 attr_version, u64 evict_ctr)
+				u64 attr_version)
 {
 	struct fuse_entry_out *o = &direntplus->entry_out;
 	struct fuse_dirent *dirent = &direntplus->dirent;
@@ -233,7 +233,7 @@ retry:
 	} else {
 		inode = fuse_iget(dir->i_sb, o->nodeid, o->generation,
 				  &o->attr, ATTR_TIMEOUT(o),
-				  attr_version, evict_ctr);
+				  attr_version);
 		if (!inode)
 			inode = ERR_PTR(-ENOMEM);
 
@@ -284,8 +284,7 @@ static void fuse_force_forget(struct file *file, u64 nodeid)
 }
 
 static int parse_dirplusfile(char *buf, size_t nbytes, struct file *file,
-			     struct dir_context *ctx, u64 attr_version,
-			     u64 evict_ctr)
+			     struct dir_context *ctx, u64 attr_version)
 {
 	struct fuse_direntplus *direntplus;
 	struct fuse_dirent *dirent;
@@ -320,7 +319,7 @@ static int parse_dirplusfile(char *buf, size_t nbytes, struct file *file,
 		buf += reclen;
 		nbytes -= reclen;
 
-		ret = fuse_direntplus_link(file, direntplus, attr_version, evict_ctr);
+		ret = fuse_direntplus_link(file, direntplus, attr_version);
 		if (ret)
 			fuse_force_forget(file, direntplus->entry_out.nodeid);
 	}
@@ -339,7 +338,7 @@ static int fuse_readdir_uncached(struct file *file, struct dir_context *ctx)
 	struct fuse_args *args = &ia.ap.args;
 	void *buf;
 	size_t bufsize = fc->max_pages << PAGE_SHIFT;
-	u64 attr_version = 0, evict_ctr = 0;
+	u64 attr_version = 0;
 	bool locked;
 
 	buf = kvmalloc(bufsize, GFP_KERNEL);
@@ -351,7 +350,6 @@ static int fuse_readdir_uncached(struct file *file, struct dir_context *ctx)
 	plus = fuse_use_readdirplus(inode, ctx);
 	if (plus) {
 		attr_version = fuse_get_attr_version(fm->fc);
-		evict_ctr = fuse_get_evict_ctr(fm->fc);
 		fuse_read_args_fill(&ia, file, ctx->pos, bufsize, FUSE_READDIRPLUS);
 	} else {
 		fuse_read_args_fill(&ia, file, ctx->pos, bufsize, FUSE_READDIR);
@@ -366,8 +364,7 @@ static int fuse_readdir_uncached(struct file *file, struct dir_context *ctx)
 			if (ff->open_flags & FOPEN_CACHE_DIR)
 				fuse_readdir_cache_end(file, ctx->pos);
 		} else if (plus) {
-			res = parse_dirplusfile(buf, res, file, ctx, attr_version,
-						evict_ctr);
+			res = parse_dirplusfile(buf, res, file, ctx, attr_version);
 		} else {
 			res = parse_dirfile(buf, res, file, ctx);
 		}
