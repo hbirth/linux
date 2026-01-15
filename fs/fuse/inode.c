@@ -231,13 +231,14 @@ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 	 * if the attr_version would've been preserved.
 	 *
 	 * !evict_ctr -> this is create
-	 * fi->attr_version != 0 -> this is not a new inode
+	 * fi->attr_version > 1 -> this is not a new inode
 	 * evict_ctr == fuse_get_evict_ctr() -> no evicts while during request
 	 */
-	if (!evict_ctr || fi->attr_version || evict_ctr == fuse_get_evict_ctr(fc))
+	if (!evict_ctr || fi->attr_version > 1 || evict_ctr == fuse_get_evict_ctr(fc))
 		set_mask_bits(&fi->inval_mask, STATX_BASIC_STATS, 0);
 
-	fi->attr_version = atomic64_inc_return(&fc->attr_version);
+	if (fi->attr_version != 1) /* fuse_iget() handle if attr_version == 1 */
+		fi->attr_version = atomic64_inc_return(&fc->attr_version);
 	fi->i_time = attr_valid;
 
 	inode->i_ino     = fuse_squash_ino(attr->ino);
@@ -520,6 +521,18 @@ retry:
 done:
 	fuse_change_attributes_i(inode, attr, NULL, attr_valid, attr_version,
 				 evict_ctr);
+
+	spin_lock(&fi->lock);
+	if (fi->attr_version == 1) /* delayed inode invalidation */
+	{
+		spin_unlock(&fi->lock);
+		down_read(&fc->killsb);
+		fuse_reverse_inval_inode(fc, nodeid, 0, 0);
+		up_read(&fc->killsb);
+	}
+	else
+		spin_unlock(&fi->lock);
+
 	return inode;
 }
 
@@ -598,6 +611,21 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 
 	fi = get_fuse_inode(inode);
 	spin_lock(&fi->lock);
+
+	if (fi->attr_version == 0)
+	{
+		/* attr_version == 0 indicate fuse_iget() is not completed yet.
+		   Skip the inode invalidation operation here, and delay it in the
+		   function fuse_iget(), after call to fuse_change_attributes_i().
+		   Initialized value of fc->attr_version is 1, so fi->attr_version
+		   will be 0 or >= 2, we use value 1 to indicate the "delayed"
+		   inode invalidation operation been recorded */
+		fi->attr_version = 1;
+		spin_unlock(&fi->lock);
+		iput(inode);
+		return 0;
+	}
+
 	fi->attr_version = atomic64_inc_return(&fc->attr_version);
 	spin_unlock(&fi->lock);
 
