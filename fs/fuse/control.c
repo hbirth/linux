@@ -184,6 +184,28 @@ out:
 	return ret;
 }
 
+static ssize_t fuse_conn_inode_count_read(struct file *file, char __user *buf,
+					   size_t len, loff_t *ppos)
+{
+	struct fuse_conn *fc;
+	unsigned long count;
+	char tmp[32];
+	size_t size;
+
+	if (*ppos)
+		return 0;
+
+	fc = fuse_ctl_file_conn_get(file);
+	if (!fc)
+		return 0;
+
+	count = atomic64_read(&fc->num_inodes);
+	fuse_conn_put(fc);
+
+	size = sprintf(tmp, "%lu\n", count);
+	return simple_read_from_buffer(buf, len, ppos, tmp, size);
+}
+
 static const struct file_operations fuse_ctl_abort_ops = {
 	.open = nonseekable_open,
 	.write = fuse_conn_abort_write,
@@ -207,6 +229,12 @@ static const struct file_operations fuse_conn_congestion_threshold_ops = {
 	.open = nonseekable_open,
 	.read = fuse_conn_congestion_threshold_read,
 	.write = fuse_conn_congestion_threshold_write,
+	.llseek = no_llseek,
+};
+
+static const struct file_operations fuse_conn_inode_count_ops = {
+	.open = nonseekable_open,
+	.read = fuse_conn_inode_count_read,
 	.llseek = no_llseek,
 };
 
@@ -278,7 +306,9 @@ int fuse_ctl_add_conn(struct fuse_conn *fc)
 				 1, NULL, &fuse_conn_max_background_ops) ||
 	    !fuse_ctl_add_dentry(parent, fc, "congestion_threshold",
 				 S_IFREG | 0600, 1, NULL,
-				 &fuse_conn_congestion_threshold_ops))
+				 &fuse_conn_congestion_threshold_ops) ||
+	    !fuse_ctl_add_dentry(parent, fc, "inode_count", S_IFREG | 0400, 1,
+				 NULL, &fuse_conn_inode_count_ops))
 		goto err;
 
 	return 0;

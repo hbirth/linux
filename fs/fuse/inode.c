@@ -182,6 +182,7 @@ static void fuse_evict_inode(struct inode *inode)
 		 */
 		if (inode->i_nlink > 0)
 			atomic64_inc(&fc->evict_ctr);
+		atomic64_dec(&fc->num_inodes);
 	}
 	if (S_ISREG(inode->i_mode) && !fuse_is_bad(inode)) {
 		WARN_ON(!list_empty(&fi->write_files));
@@ -504,6 +505,7 @@ retry:
 		inode->i_generation = generation;
 		fuse_init_inode(inode, attr, fc);
 		unlock_new_inode(inode);
+		atomic64_inc(&fc->num_inodes);
 	} else if (fuse_stale_inode(inode, generation, attr)) {
 		/* nodeid was reused, any I/O on the old inode should fail */
 		fuse_make_bad(inode);
@@ -1036,6 +1038,7 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 
 	atomic64_set(&fc->attr_version, 1);
 	atomic64_set(&fc->evict_ctr, 1);
+	atomic64_set(&fc->num_inodes, 0);
 	get_random_bytes(&fc->scramble_key, sizeof(fc->scramble_key));
 	fc->pid_ns = get_pid_ns(task_active_pid_ns(current));
 	fc->user_ns = get_user_ns(user_ns);

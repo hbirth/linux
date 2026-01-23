@@ -47,7 +47,7 @@
 #define FUSE_NAME_MAX (PATH_MAX - 1)
 
 /** Number of dentries for each connection in the control filesystem */
-#define FUSE_CTL_NUM_DENTRIES 5
+#define FUSE_CTL_NUM_DENTRIES 6
 
 /** Maximum of max_pages received in init_out */
 extern unsigned int fuse_max_pages_limit;
@@ -898,6 +898,8 @@ struct fuse_conn {
 
 	/** Version counter for evict inode */
 	atomic64_t evict_ctr;
+
+	atomic64_t num_inodes;
 
 	/* maximum file name length */
 	u32 name_max;
