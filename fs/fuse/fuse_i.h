@@ -47,7 +47,7 @@
 #define FUSE_NAME_MAX (PATH_MAX - 1)
 
 /** Number of dentries for each connection in the control filesystem */
-#define FUSE_CTL_NUM_DENTRIES 6
+#define FUSE_CTL_NUM_DENTRIES 7
 
 /** Maximum of max_pages received in init_out */
 extern unsigned int fuse_max_pages_limit;
