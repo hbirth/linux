@@ -373,6 +373,32 @@ static void fuse_lookup_init(struct fuse_conn *fc, struct fuse_args *args,
 }
 
 /*
+ * Helper function to initialize fuse_args for MKNOD operations
+ */
+void fuse_mknod_args_fill(struct fuse_args *args, u64 nodeid,
+			  const struct qstr *name, umode_t mode, dev_t rdev,
+			  struct fuse_mknod_in *inarg,
+			  struct fuse_entry_out *outarg)
+{
+	memset(inarg, 0, sizeof(*inarg));
+	inarg->mode = mode;
+	inarg->rdev = new_encode_dev(rdev);
+	inarg->umask = current_umask();
+
+	memset(outarg, 0, sizeof(*outarg));
+	args->opcode = FUSE_MKNOD;
+	args->nodeid = nodeid;
+	args->in_numargs = 2;
+	args->in_args[0].size = sizeof(*inarg);
+	args->in_args[0].value = inarg;
+	args->in_args[1].size = name->len + 1;
+	args->in_args[1].value = name->name;
+	args->out_numargs = 1;
+	args->out_args[0].size = sizeof(*outarg);
+	args->out_args[0].value = outarg;
+}
+
+/*
  * Check whether the dentry is still valid
  *
  * If the entry validity timeout has expired and the dentry is
@@ -923,8 +949,460 @@ out_err:
 	return err;
 }
 
+/*
+ * Handle LOOKUP result and instantiate dentry if file exists
+ *
+ * Returns:
+ *   0 if file doesn't exist (LOOKUP returned -ENOENT or nodeid == 0)
+ *   -EEXIST if file exists and was successfully instantiated
+ *   other negative error codes on failure
+ */
+static int fuse_handle_lookup_result(int lookup_err,
+				      struct fuse_entry_out *outarg,
+				      struct inode *dir, struct dentry *entry,
+				      int epoch, struct fuse_conn *fc)
+{
+	struct fuse_forget_link *forget;
+	struct dentry *d;
+	struct inode *inode;
+
+	/* Zero nodeid is same as -ENOENT, but with valid timeout */
+	if (lookup_err || !outarg->nodeid) {
+		if (lookup_err != -ENOENT && lookup_err != 0)
+			return lookup_err;
+		return 0;
+	}
+
+	/* Validate nodeid - catch obviously invalid values */
+	if (invalid_nodeid(outarg->nodeid)) {
+		pr_warn_ratelimited("fuse: invalid nodeid %llu from lookup\n",
+				    outarg->nodeid);
+		return -EIO;
+	}
+
+	/*
+	 * Additional validation: catch small garbage values that look
+	 * suspicious (likely uninitialized memory)
+	 */
+	if (outarg->nodeid > 1 && outarg->nodeid < 256) {
+		pr_warn_ratelimited("fuse: suspicious small nodeid %llu (0x%llx) from lookup\n",
+				    outarg->nodeid, outarg->nodeid);
+		return -EIO;
+	}
+
+	/* LOOKUP succeeded - file exists, handle like fuse_lookup() */
+	if (fuse_invalid_attr(&outarg->attr))
+		return -EIO;
+
+	if (outarg->nodeid == FUSE_ROOT_ID && outarg->generation != 0) {
+		pr_warn_once("root generation should be zero\n");
+		outarg->generation = 0;
+	}
+
+	inode = fuse_iget(dir->i_sb, outarg->nodeid, outarg->generation,
+			  &outarg->attr, ATTR_TIMEOUT(outarg), 0, 0);
+	if (!inode) {
+		forget = fuse_alloc_forget();
+		if (forget)
+			fuse_queue_forget(fc, forget, outarg->nodeid, 1);
+		return -ENOMEM;
+	}
+
+	if (get_node_id(inode) == FUSE_ROOT_ID) {
+		iput(inode);
+		return -EIO;
+	}
+
+	d_drop(entry);
+	d = d_splice_alias(inode, entry);
+	if (IS_ERR(d))
+		return PTR_ERR(d);
+
+	if (d) {
+		d->d_time = epoch;
+		fuse_change_entry_timeout(d, outarg);
+		dput(d);
+	} else {
+		entry->d_time = epoch;
+		fuse_change_entry_timeout(entry, outarg);
+	}
+
+	fuse_dir_changed(dir);
+
+	return -EEXIST;
+}
+
+/*
+ * Handle MKNOD result from compound request
+ *
+ * Validates the mknod output and checks for errors.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+static int fuse_handle_mknod_result(struct fuse_compound_req *compound,
+				     struct fuse_entry_out *mknod_out,
+				     umode_t mode)
+{
+	int err;
+
+	err = fuse_compound_get_error(compound, 1);
+	if (err)
+		return err;
+
+	if (invalid_nodeid(mknod_out->nodeid) ||
+	    fuse_invalid_attr(&mknod_out->attr))
+		return -EIO;
+
+	if ((mknod_out->attr.mode ^ mode) & S_IFMT)
+		return -EIO;
+
+	return 0;
+}
+
+/*
+ * Finalize atomic open
+ *
+ * Creates inode, instantiates dentry, and opens file.
+ * On success, ff is transferred to file->private_data and *ff_ptr is set to NULL.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+static int fuse_finalize_atomic_open(struct inode *dir, struct dentry *entry,
+				      struct file *file, unsigned int flags,
+				      struct fuse_file **ff_ptr,
+				      struct fuse_entry_out *mknod_out,
+				      int epoch, struct fuse_conn *fc)
+{
+	struct fuse_file *ff = *ff_ptr;
+	struct fuse_forget_link *forget;
+	struct fuse_inode *fi;
+	struct inode *inode;
+	int err;
+
+	inode = fuse_iget(dir->i_sb, mknod_out->nodeid, mknod_out->generation,
+			  &mknod_out->attr, ATTR_TIMEOUT(mknod_out), 0, 0);
+	if (!inode) {
+		forget = fuse_alloc_forget();
+		fuse_sync_release(NULL, ff, flags);
+		*ff_ptr = NULL;
+		if (forget)
+			fuse_queue_forget(fc, forget, mknod_out->nodeid, 1);
+		return -ENOMEM;
+	}
+
+	/* Check if dentry is already instantiated (e.g., from a racing lookup
+	 * or revalidate). If so, just update attributes instead of trying to
+	 * instantiate again.
+	 */
+	if (d_really_is_positive(entry)) {
+		/* Dentry already has an inode - verify it matches */
+		if (d_inode(entry) != inode) {
+			/* Different inode - this is unexpected */
+			iput(inode);
+			err = -EIO;
+			goto out_release;
+		}
+		/* Same inode - just update attributes and release our ref */
+		fuse_change_attributes(inode, &mknod_out->attr, NULL,
+				       ATTR_TIMEOUT(mknod_out), 0);
+		iput(inode);
+	} else {
+		struct dentry *d;
+
+		/* Normal case - instantiate the new inode.
+		 * The dentry might be hashed (from a previous negative lookup),
+		 * so we need to unhash it first before calling d_splice_alias().
+		 */
+		if (!d_unhashed(entry))
+			d_drop(entry);
+
+		d = d_splice_alias(inode, entry);
+		if (IS_ERR(d)) {
+			err = PTR_ERR(d);
+			goto out_release;
+		}
+		if (d) {
+			/* d_splice_alias() returned a different dentry */
+			dput(d);
+		}
+	}
+
+	entry->d_time = epoch;
+	fuse_change_entry_timeout(entry, mknod_out);
+	fuse_dir_changed(dir);
+
+	err = generic_file_open(d_inode(entry), file);
+	if (err)
+		goto out_release;
+
+	file->private_data = ff;
+
+	err = finish_open(file, entry, fuse_finish_open);
+	if (err) {
+		fi = get_fuse_inode(d_inode(entry));
+		fuse_sync_release(fi, file->private_data, flags);
+		file->private_data = NULL;
+		*ff_ptr = NULL;
+		return err;
+	}
+
+	*ff_ptr = NULL;
+
+	if ((flags & O_TRUNC) && fc->atomic_o_trunc)
+		truncate_pagecache(d_inode(entry), 0);
+	else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
+		invalidate_inode_pages2(d_inode(entry)->i_mapping);
+
+	return 0;
+
+out_release:
+	fuse_sync_release(get_fuse_inode(inode), ff, flags);
+	*ff_ptr = NULL;
+	forget = fuse_alloc_forget();
+	if (forget)
+		fuse_queue_forget(fc, forget, mknod_out->nodeid, 1);
+	iput(inode);
+	return err;
+}
+
+static int fuse_atomic_open_compound(struct mnt_idmap *idmap,
+				     struct inode *dir, struct dentry *entry,
+				     struct file *file, unsigned int flags,
+				     umode_t mode)
+{
+	struct fuse_mount *fm = get_fuse_mount(dir);
+	struct fuse_conn *fc = fm->fc;
+	struct fuse_compound_req *compound = NULL;
+	struct fuse_file *ff = NULL;
+	int epoch;
+	int err;
+
+	FUSE_ARGS(lookup_args);
+	struct fuse_entry_out lookup_out = {};
+
+	FUSE_ARGS(mknod_args);
+	struct fuse_mknod_in mknod_in = {};
+	struct fuse_entry_out mknod_out = {};
+
+	FUSE_ARGS(open_args);
+	struct fuse_open_in open_in;
+	struct fuse_open_out open_out = {};
+	bool need_create = (flags & O_CREAT);
+	bool file_created = false;
+
+	epoch = atomic_read(&fc->epoch);
+
+	ff = fuse_file_alloc(fm, true);
+	if (!ff)
+		return -ENOMEM;
+
+	compound = fuse_compound_alloc(fm, FUSE_COMPOUND_ATOMIC);
+	if (!compound) {
+		err = -ENOMEM;
+		goto out_free_ff;
+	}
+
+	fuse_lookup_init(fc, &lookup_args, get_node_id(dir), &entry->d_name,
+			 &lookup_out);
+	err = fuse_compound_add(compound, &lookup_args);
+	if (err)
+		goto out_free_compound;
+
+	/* Only add MKNOD if O_CREAT is set */
+	if (need_create) {
+		if (!fc->dont_mask)
+			mode &= ~current_umask();
+
+		fuse_mknod_args_fill(&mknod_args, get_node_id(dir), &entry->d_name,
+				     mode, 0, &mknod_in, &mknod_out);
+
+		/* Add security context and supplementary groups for MKNOD */
+		err = get_create_ext(idmap, &mknod_args, dir, entry, mode);
+		if (err)
+			goto out_free_compound;
+
+		err = fuse_compound_add(compound, &mknod_args);
+		if (err) {
+			free_ext_value(&mknod_args);
+			goto out_free_compound;
+		}
+	}
+
+	memset(&open_in, 0, sizeof(open_in));
+	open_in.flags = flags & ~(O_CREAT | O_EXCL | O_NOCTTY);
+	if (!fc->atomic_o_trunc)
+		open_in.flags &= ~O_TRUNC;
+
+	if (fc->handle_killpriv_v2 && (flags & O_TRUNC) &&
+	    !(flags & O_EXCL) && !capable(CAP_FSETID))
+		open_in.open_flags |= FUSE_OPEN_KILL_SUIDGID;
+
+	memset(&open_out, 0, sizeof(open_out));
+	fuse_open_args_fill(&open_args, 0, FUSE_OPEN, &open_in, &open_out);
+
+	err = fuse_compound_add(compound, &open_args);
+	if (err)
+		goto out_free_ext;
+
+	err = fuse_compound_send(compound);
+	if (err == -ENOSYS || err == -EOPNOTSUPP) {
+		fc->compound_lookup_create = 0;
+		err = -ENOSYS;
+		goto out_free_ext;
+	}
+	if (err)
+		goto out_free_ext;
+
+	/*
+	 * For atomic compound operations, the server handles all the logic.
+	 * We just need to check which operation succeeded and use those results.
+	 */
+
+	/* Determine which operation provided the inode */
+	if (need_create) {
+		/* Check if MKNOD succeeded (file was created) */
+		int mknod_err = fuse_compound_get_error(compound, 1);
+		if (mknod_err == 0) {
+			/* MKNOD succeeded - file was created */
+			file_created = true;
+			err = fuse_handle_mknod_result(compound, &mknod_out, mode);
+			if (err)
+				goto out_free_ext;
+
+			/* Check OPEN result */
+			err = fuse_compound_get_error(compound, 2);
+			if (err) {
+				/* MKNOD succeeded but OPEN failed - need to instantiate
+				 * the dentry so the file is visible, even though we
+				 * couldn't open it */
+				struct inode *inode;
+				inode = fuse_iget(dir->i_sb, mknod_out.nodeid,
+						  mknod_out.generation, &mknod_out.attr,
+						  ATTR_TIMEOUT(&mknod_out), 0, 0);
+				if (inode) {
+					d_instantiate(entry, inode);
+					file->f_mode |= FMODE_CREATED;
+				}
+				goto out_free_ext;
+			}
+
+			ff->fh = open_out.fh;
+			ff->open_flags = open_out.open_flags;
+			ff->nodeid = mknod_out.nodeid;
+
+			file->f_mode |= FMODE_CREATED;
+			err = fuse_finalize_atomic_open(dir, entry, file, flags, &ff,
+							&mknod_out, epoch, fc);
+		} else {
+			/* MKNOD failed - file existed, LOOKUP should have succeeded */
+			int lookup_err = fuse_compound_get_error(compound, 0);
+
+			/* If LOOKUP failed, don't use potentially garbage data */
+			if (lookup_err) {
+				err = lookup_err;
+				goto out_free_ext;
+			}
+
+			err = fuse_handle_lookup_result(lookup_err, &lookup_out, dir, entry,
+							epoch, fc);
+			if (err != -EEXIST) {
+				/* MKNOD failed for a reason other than file exists,
+				 * and LOOKUP also didn't find the file. In atomic
+				 * compound operations, this shouldn't happen. */
+				if (err == 0)
+					err = -ENOENT;
+				goto out_free_ext;
+			}
+
+			/* File exists - check O_EXCL */
+			if (flags & O_EXCL) {
+				err = -EEXIST;
+				goto out_free_ext;
+			}
+
+			/* Check OPEN result */
+			err = fuse_compound_get_error(compound, 2);
+			if (err) {
+				/* LOOKUP succeeded but OPEN failed - the dentry is already
+				 * instantiated by fuse_handle_lookup_result, just return error */
+				goto out_free_ext;
+			}
+
+			ff->fh = open_out.fh;
+			ff->open_flags = open_out.open_flags;
+			ff->nodeid = lookup_out.nodeid;
+
+			/* Dentry was already instantiated by fuse_handle_lookup_result(),
+			 * so we just need to finish the open without calling fuse_iget() again.
+			 * Calling fuse_finalize_atomic_open() would increment nlookup again. */
+			err = finish_open(file, entry, generic_file_open);
+			if (!err) {
+				file->private_data = ff;
+				ff = NULL;
+			}
+		}
+	} else {
+		/* No O_CREAT - just LOOKUP+OPEN */
+		int lookup_err = fuse_compound_get_error(compound, 0);
+
+		/* If LOOKUP failed, don't use potentially garbage data */
+		if (lookup_err) {
+			err = lookup_err;
+			goto out_free_ext;
+		}
+
+		err = fuse_handle_lookup_result(lookup_err, &lookup_out, dir,
+						 entry, epoch, fc);
+		if (err != -EEXIST) {
+			if (err == 0) {
+				/* File doesn't exist (negative dentry) */
+				err = -ENOENT;
+			}
+			goto out_free_ext;
+		}
+
+		/* Check OPEN result */
+		err = fuse_compound_get_error(compound, 1);
+		if (err) {
+			/*
+			 * LOOKUP succeeded but OPEN failed - the dentry is
+			 * already instantiated by fuse_handle_lookup_result,
+			 * just return error
+			 */
+			goto out_free_ext;
+		}
+
+		ff->fh = open_out.fh;
+		ff->open_flags = open_out.open_flags;
+		ff->nodeid = lookup_out.nodeid;
+
+		/*
+		 * Dentry was already instantiated by fuse_handle_lookup_result(),
+		 * so we just need to finish the open without calling fuse_iget()
+		 * again. Calling fuse_finalize_atomic_open() would increment
+		 * nlookup again.
+		 */
+		err = finish_open(file, entry, generic_file_open);
+		if (!err) {
+			file->private_data = ff;
+			ff = NULL;
+		}
+	}
+
+out_free_ext:
+	if (need_create)
+		free_ext_value(&mknod_args);
+out_free_compound:
+	kfree(compound);
+out_free_ff:
+	if (ff)
+		fuse_file_free(ff);
+	return err;
+}
+
 static int fuse_mknod(struct mnt_idmap *, struct inode *, struct dentry *,
 		      umode_t, dev_t);
+
 static int fuse_atomic_open(struct inode *dir, struct dentry *entry,
 			    struct file *file, unsigned flags,
 			    umode_t mode)
@@ -935,6 +1413,15 @@ static int fuse_atomic_open(struct inode *dir, struct dentry *entry,
 
 	if (fuse_is_bad(dir))
 		return -EIO;
+
+	/* Try compound atomic_open first */
+	if (fc->compound_lookup_create) {
+		err = fuse_atomic_open_compound(idmap, dir, entry, file, flags, mode);
+		if (err != -ENOSYS)
+			return err;
+	}
+
+	/* Fall back to the old atomic open */
 
 	if (d_in_lookup(entry)) {
 		struct dentry *res = fuse_lookup(dir, entry, 0);
@@ -951,6 +1438,7 @@ static int fuse_atomic_open(struct inode *dir, struct dentry *entry,
 	if (fc->no_create)
 		goto mknod;
 
+	/* Try FUSE_CREATE for servers without compound support */
 	err = fuse_create_open(idmap, dir, entry, file, flags, mode, FUSE_CREATE);
 	if (err == -ENOSYS) {
 		fc->no_create = 1;
@@ -960,6 +1448,7 @@ static int fuse_atomic_open(struct inode *dir, struct dentry *entry,
 	return err;
 
 mknod:
+	/* Fall back to separate mknod + open */
 	err = fuse_mknod(idmap, dir, entry, mode, 0);
 	if (err)
 		return err;
@@ -1062,22 +1551,15 @@ static int fuse_mknod(struct mnt_idmap *idmap, struct inode *dir,
 		      struct dentry *entry, umode_t mode, dev_t rdev)
 {
 	struct fuse_mknod_in inarg;
+	struct fuse_entry_out outarg;
 	struct fuse_mount *fm = get_fuse_mount(dir);
 	FUSE_ARGS(args);
 
 	if (!fm->fc->dont_mask)
 		mode &= ~current_umask();
 
-	memset(&inarg, 0, sizeof(inarg));
-	inarg.mode = mode;
-	inarg.rdev = new_encode_dev(rdev);
-	inarg.umask = current_umask();
-	args.opcode = FUSE_MKNOD;
-	args.in_numargs = 2;
-	args.in_args[0].size = sizeof(inarg);
-	args.in_args[0].value = &inarg;
-	args.in_args[1].size = entry->d_name.len + 1;
-	args.in_args[1].value = entry->d_name.name;
+	fuse_mknod_args_fill(&args, get_node_id(dir), &entry->d_name,
+			     mode, rdev, &inarg, &outarg);
 	return create_new_nondir(idmap, fm, &args, dir, entry, mode);
 }
 

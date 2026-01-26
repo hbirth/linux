@@ -926,6 +926,7 @@ struct fuse_conn {
 
 	/* Does the filesystem support compound operations? */
 	unsigned int compound_open_getattr:1;
+	unsigned int compound_lookup_create:1;
 
 	/** Maximum stack depth for passthrough backing files */
 	int max_stack_depth;
@@ -1185,9 +1186,15 @@ void fuse_read_args_fill(struct fuse_io_args *ia, struct file *file, loff_t pos,
 /*
  * Helper functions to initialize fuse_args for common operations
  */
+void fuse_open_args_fill(struct fuse_args *args, u64 nodeid, int opcode,
+			 struct fuse_open_in *inarg, struct fuse_open_out *outarg);
 void fuse_getattr_args_fill(struct fuse_args *args, u64 nodeid,
 			    struct fuse_getattr_in *inarg,
 			    struct fuse_attr_out *outarg);
+void fuse_mknod_args_fill(struct fuse_args *args, u64 nodeid,
+			  const struct qstr *name, umode_t mode, dev_t rdev,
+			  struct fuse_mknod_in *inarg,
+			  struct fuse_entry_out *outarg);
 
 struct fuse_file *fuse_file_alloc(struct fuse_mount *fm, bool release);
 void fuse_file_free(struct fuse_file *ff);

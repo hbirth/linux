@@ -26,7 +26,7 @@
 /*
  * Helper function to initialize fuse_args for OPEN/OPENDIR operations
  */
-static void fuse_open_args_fill(struct fuse_args *args, u64 nodeid, int opcode,
+void fuse_open_args_fill(struct fuse_args *args, u64 nodeid, int opcode,
 			 struct fuse_open_in *inarg, struct fuse_open_out *outarg)
 {
 	args->opcode = opcode;

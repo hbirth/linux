@@ -996,6 +996,7 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 	 * until it tells us otherwise.
 	 */
 	fc->compound_open_getattr = 1;
+	fc->compound_lookup_create = 1;
 
 	atomic64_set(&fc->attr_version, 1);
 	atomic64_set(&fc->evict_ctr, 1);
