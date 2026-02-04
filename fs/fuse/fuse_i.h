@@ -940,6 +940,15 @@ struct fuse_conn {
 
 };
 
+#define FUSE_PRUNE_DENTRY_BATCH 512
+
+/* Prune context - used by the worker to collect dentries */
+struct fuse_prune_ctx {
+	struct dentry *dentries[FUSE_PRUNE_DENTRY_BATCH];
+	unsigned long count;
+	unsigned long max;
+};
+
 /*
  * Represents a mounted filesystem, potentially a submount.
  *
@@ -960,6 +969,13 @@ struct fuse_mount {
 	/* Entry on fc->mounts */
 	struct list_head fc_entry;
 	struct rcu_head rcu;
+
+	/* LRU pruning worker */
+	struct delayed_work lru_prune_work;
+	unsigned long max_inodes;
+
+	/* Prune context - used by the worker to collect dentries */
+	struct fuse_prune_ctx prune_ctx;
 };
 
 /*
@@ -1495,5 +1511,11 @@ extern void fuse_sysctl_unregister(void);
 #define fuse_sysctl_register()		(0)
 #define fuse_sysctl_unregister()	do { } while (0)
 #endif /* CONFIG_SYSCTL */
+
+/* Unified LRU pruning for dentries and inodes (on-demand only) */
+void fuse_lru_prune_init(struct fuse_mount *fm, unsigned long max_inodes);
+void fuse_lru_prune_stop(struct fuse_mount *fm);
+void fuse_lru_prune_set_inode_limit(struct fuse_mount *fm, unsigned long max_inodes);
+bool fuse_lru_prune_trigger(struct fuse_mount *fm);
 
 #endif /* _FS_FUSE_I_H */

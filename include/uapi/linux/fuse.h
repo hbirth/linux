@@ -920,7 +920,8 @@ struct fuse_init_out {
 	uint32_t	max_stack_depth;
 	uint8_t		align_page_order;
 	uint8_t		padding[3];
-	uint32_t	unused[5];
+	uint32_t	max_inodes;
+	uint32_t	unused[4];
 };
 
 #define CUSE_INIT_INFO_MAX 4096

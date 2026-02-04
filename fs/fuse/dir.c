@@ -22,6 +22,9 @@
 #include <linux/security.h>
 #include <linux/types.h>
 #include <linux/kernel.h>
+#include <linux/dcache.h>
+#include <linux/list_lru.h>
+#include <linux/workqueue.h>
 
 static bool __read_mostly allow_sys_admin_access;
 module_param(allow_sys_admin_access, bool, 0644);
@@ -2232,4 +2235,126 @@ void fuse_init_symlink(struct inode *inode)
 	inode->i_op = &fuse_symlink_inode_operations;
 	inode->i_data.a_ops = &fuse_symlink_aops;
 	inode_nohighmem(inode);
+}
+
+static enum lru_status fuse_lru_isolate(struct list_head *item,
+					 struct list_lru_one *lru,
+					 spinlock_t *lru_lock,
+					 void *arg)
+{
+	struct dentry *dentry = container_of(item, struct dentry, d_lru);
+	struct fuse_prune_ctx *ctx = arg;
+
+	if (!spin_trylock(&dentry->d_lock))
+		return LRU_SKIP;
+
+	/* Skip dentries that are in use or already unhashed */
+	if (dentry->d_lockref.count > 0 || d_unhashed(dentry)) {
+		spin_unlock(&dentry->d_lock);
+		return LRU_SKIP;
+	}
+
+	/* Skip negative dentries - they don't have inodes to forget */
+	if (!d_inode(dentry)) {
+		spin_unlock(&dentry->d_lock);
+		return LRU_ROTATE;
+	}
+
+	/* Skip directories - d_invalidate() would recursively shrink children */
+	if (d_is_dir(dentry)) {
+		spin_unlock(&dentry->d_lock);
+		return LRU_ROTATE;
+	}
+
+	/* Check if we've collected enough dentries */
+	if (ctx->count >= ctx->max) {
+		spin_unlock(&dentry->d_lock);
+		return LRU_SKIP;
+	}
+
+	/* Grab a reference and collect this dentry for pruning */
+	dget_dlock(dentry);
+	spin_unlock(&dentry->d_lock);
+
+	ctx->dentries[ctx->count++] = dentry;
+	return LRU_ROTATE;
+}
+
+static void fuse_lru_prune_worker(struct work_struct *work)
+{
+	struct fuse_mount *fm = container_of(work, struct fuse_mount,
+					     lru_prune_work.work);
+	struct super_block *sb;
+	unsigned long i;
+
+	down_read(&fm->fc->killsb);
+	sb = fm->sb;
+	if (!sb) {
+		up_read(&fm->fc->killsb);
+		return;
+	}
+
+	fm->prune_ctx.count = 0;
+	fm->prune_ctx.max = ARRAY_SIZE(fm->prune_ctx.dentries);
+
+	if (fm->max_inodes && atomic64_read(&fm->fc->num_inodes) > fm->max_inodes) {
+		unsigned long to_scan = atomic64_read(&fm->fc->num_inodes) - fm->max_inodes;
+		list_lru_walk(&sb->s_dentry_lru, fuse_lru_isolate, &fm->prune_ctx,
+			      min(to_scan, (unsigned long)ARRAY_SIZE(fm->prune_ctx.dentries)));
+	}
+
+	up_read(&fm->fc->killsb);
+
+	/*
+	 * Invalidate dentries to free them and send FORGET to server.
+	 * We only collected non-directory dentries, so d_invalidate()
+	 * won't recursively shrink children.
+	 *
+	 * Since we're only collecting the exact excess (not being aggressive),
+	 * this should be safe and won't flood the server with FORGET requests.
+	 */
+	for (i = 0; i < fm->prune_ctx.count; i++) {
+		d_invalidate(fm->prune_ctx.dentries[i]);
+		dput(fm->prune_ctx.dentries[i]);
+	}
+}
+
+void fuse_lru_prune_init(struct fuse_mount *fm, unsigned long max_inodes)
+{
+	INIT_DELAYED_WORK(&fm->lru_prune_work, fuse_lru_prune_worker);
+	fuse_lru_prune_set_inode_limit(fm, max_inodes);
+}
+
+void fuse_lru_prune_stop(struct fuse_mount *fm)
+{
+	if (fm->max_inodes == 0)
+		return;
+
+	fm->max_inodes = 0;
+	cancel_delayed_work_sync(&fm->lru_prune_work);
+}
+
+void fuse_lru_prune_set_inode_limit(struct fuse_mount *fm, unsigned long max_inodes)
+{
+	WRITE_ONCE(fm->max_inodes, max_inodes);
+}
+
+bool fuse_lru_prune_trigger(struct fuse_mount *fm)
+{
+	struct super_block *sb;
+
+	if (fm->max_inodes == 0)
+		return false;
+
+	sb = READ_ONCE(fm->sb);
+	if (!sb)
+		return false;
+
+	if (fm->max_inodes > 0 &&
+	    atomic64_read(&fm->fc->num_inodes) > fm->max_inodes) {
+		mod_delayed_work(system_wq, &fm->lru_prune_work, 0);
+		return true;
+	}
+
+	return false;
 }

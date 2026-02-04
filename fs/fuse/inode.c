@@ -153,15 +153,16 @@ static void fuse_cleanup_submount_lookup(struct fuse_conn *fc,
 static void fuse_evict_inode(struct inode *inode)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct fuse_conn *fc = get_fuse_conn(inode);
 
 	/* Will write inode on close/munmap and in all other dirtiers */
 	WARN_ON(inode->i_state & I_DIRTY_INODE);
 
 	truncate_inode_pages_final(&inode->i_data);
 	clear_inode(inode);
-	if (inode->i_sb->s_flags & SB_ACTIVE) {
-		struct fuse_conn *fc = get_fuse_conn(inode);
+	atomic64_dec(&fc->num_inodes);
 
+	if (inode->i_sb->s_flags & SB_ACTIVE) {
 		if (FUSE_IS_DAX(inode))
 			fuse_dax_inode_cleanup(inode);
 		if (fi->nlookup) {
@@ -182,7 +183,6 @@ static void fuse_evict_inode(struct inode *inode)
 		 */
 		if (inode->i_nlink > 0)
 			atomic64_inc(&fc->evict_ctr);
-		atomic64_dec(&fc->num_inodes);
 	}
 	if (S_ISREG(inode->i_mode) && !fuse_is_bad(inode)) {
 		WARN_ON(!list_empty(&fi->write_files));
@@ -522,6 +522,9 @@ retry:
 done:
 	fuse_change_attributes_i(inode, attr, NULL, attr_valid, attr_version,
 				 evict_ctr);
+
+	fuse_lru_prune_trigger(get_fuse_mount_super(sb));
+
 	return inode;
 }
 
@@ -1038,7 +1041,6 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 
 	atomic64_set(&fc->attr_version, 1);
 	atomic64_set(&fc->evict_ctr, 1);
-	atomic64_set(&fc->num_inodes, 0);
 	get_random_bytes(&fc->scramble_key, sizeof(fc->scramble_key));
 	fc->pid_ns = get_pid_ns(task_active_pid_ns(current));
 	fc->user_ns = get_user_ns(user_ns);
@@ -1458,6 +1460,10 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 		fc->max_write = arg->minor < 5 ? 4096 : arg->max_write;
 		fc->max_write = max_t(unsigned, 4096, fc->max_write);
 		fc->conn_init = 1;
+
+		/* Initialize unified LRU pruning if inode limit is set */
+		if (arg->max_inodes > 0)
+			fuse_lru_prune_init(fm, arg->max_inodes);
 	}
 	kfree(ia);
 
@@ -2103,6 +2109,7 @@ static void fuse_sb_destroy(struct super_block *sb)
 
 void fuse_mount_destroy(struct fuse_mount *fm)
 {
+	fuse_lru_prune_stop(fm);
 	fuse_conn_put(fm->fc);
 	kfree_rcu(fm, rcu);
 }
