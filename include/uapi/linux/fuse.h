@@ -905,9 +905,6 @@ struct fuse_init_in {
 #define FUSE_COMPAT_INIT_OUT_SIZE 8
 #define FUSE_COMPAT_22_INIT_OUT_SIZE 24
 
-/*
- * align_page_order: Number of pages for optimal IO, or a multiple of that
- */
 struct fuse_init_out {
 	uint32_t	major;
 	uint32_t	minor;
