@@ -77,6 +77,7 @@ extern struct mutex fuse_mutex;
 /** Module parameters */
 extern unsigned int max_user_bgreq;
 extern unsigned int max_user_congthresh;
+extern bool enable_large_folios;
 
 /* One forget request */
 struct fuse_forget_link {
@@ -933,7 +934,7 @@ struct fuse_conn {
 
 	/** Maximum stack depth for passthrough backing files */
 	int max_stack_depth;
-	
+
 	/* Does the filesystem support compound operations? */
 	unsigned int compound_open_getattr:1;
 
