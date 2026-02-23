@@ -2242,7 +2242,7 @@ static void fuse_writepages_send(struct inode *inode,
 }
 
 
-static bool fuse_writepage_need_send(struct fuse_conn *fc, 
+static bool fuse_writepage_need_send(struct fuse_conn *fc,
 					loff_t pos, unsigned len,
 					struct fuse_args_pages *ap,
 					struct fuse_fill_wb_data *data,
@@ -3352,4 +3352,7 @@ void fuse_init_file_inode(struct inode *inode, unsigned int flags)
 
 	if (IS_ENABLED(CONFIG_FUSE_DAX))
 		fuse_dax_inode_init(inode, flags);
+
+	if (enable_large_folios)
+		mapping_set_large_folios(inode->i_mapping);
 }
