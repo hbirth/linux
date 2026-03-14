@@ -27,6 +27,7 @@ struct fuse_copy_state {
 	struct pipe_buffer *pipebufs;
 	struct pipe_buffer *currbuf;
 	struct pipe_inode_info *pipe;
+	struct folio *folio_write;
 	unsigned long nr_segs;
 	struct page *pg;
 	unsigned int len;

@@ -815,7 +815,7 @@ void fuse_copy_finish(struct fuse_copy_state *cs)
 			buf->len = PAGE_SIZE - cs->len;
 		cs->currbuf = NULL;
 	} else if (cs->pg) {
-		if (cs->write) {
+		if (cs->write && !cs->folio_write) {
 			flush_dcache_page(cs->pg);
 			set_page_dirty_lock(cs->pg);
 		}
@@ -1084,6 +1084,7 @@ static int fuse_copy_folio(struct fuse_copy_state *cs, struct folio **foliop,
 			folio_zero_range(folio, 0, size);
 	}
 
+	cs->folio_write = folio;
 	while (count) {
 		if (cs->write && cs->pipebufs && folio) {
 			/*
@@ -1125,8 +1126,13 @@ static int fuse_copy_folio(struct fuse_copy_state *cs, struct folio **foliop,
 		} else
 			offset += fuse_copy_do(cs, NULL, &count);
 	}
-	if (folio && !cs->write)
+	if (folio) {
 		flush_dcache_folio(folio);
+		if (cs->write) {
+			folio_mark_dirty_lock(folio);
+		}
+	}
+	cs->folio_write = NULL;
 	return 0;
 }
 
