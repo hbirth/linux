@@ -373,6 +373,117 @@ static void fuse_lookup_init(struct fuse_args *args, u64 nodeid,
 }
 
 /*
+ * Revalidate a dentry using compound LOOKUP+GETATTR operation.
+ * This reduces round-trips when both dentry and attributes need refreshing.
+ */
+static int fuse_dentry_revalidate_compound(struct inode *dir,
+					   const struct qstr *name,
+					   struct dentry *entry,
+					   struct inode *inode,
+					   struct fuse_mount *fm,
+					   u64 attr_version)
+{
+	struct fuse_entry_out lookup_out = {};
+	struct fuse_attr_out getattr_out = {};
+	struct fuse_getattr_in getattr_in = {};
+	FUSE_ARGS(lookup_args);
+	FUSE_ARGS(getattr_args);
+	struct fuse_forget_link *forget;
+	struct fuse_compound_req_in lookup_req = {
+		.flags = FUSE_COMPOUND_SUB_IS_ENTRY,
+		.sub_dep_index = 0,
+	};
+	struct fuse_compound_req_in getattr_req = {
+		.flags = FUSE_COMPOUND_SUB_IS_DEP,
+		.sub_dep_index = 0, /* depends on lookup (index 0) */
+	};
+	int lookup_err = 0, getattr_err = 0;
+	struct fuse_compound_arg compound_ops[2];
+	int ret;
+	struct fuse_inode *fi;
+
+	forget = fuse_alloc_forget();
+	if (!forget)
+		return -ENOMEM;
+
+	/* Setup LOOKUP operation */
+	fuse_lookup_init(&lookup_args, get_node_id(dir),
+			 name, &lookup_out);
+
+	/* Setup GETATTR operation - nodeid will be filled from lookup result */
+	getattr_args.opcode = FUSE_GETATTR;
+	getattr_args.nodeid = 0; /* Will be set from lookup result */
+	getattr_args.in_numargs = 1;
+	getattr_args.in_args[0].size = sizeof(getattr_in);
+	getattr_args.in_args[0].value = &getattr_in;
+	getattr_args.out_numargs = 1;
+	getattr_args.out_args[0].size = sizeof(getattr_out);
+	getattr_args.out_args[0].value = &getattr_out;
+
+	/* Build compound request */
+	compound_ops[0].arg = &lookup_args;
+	compound_ops[0].error = &lookup_err;
+	compound_ops[0].req = &lookup_req;
+
+	compound_ops[1].arg = &getattr_args;
+	compound_ops[1].error = &getattr_err;
+	compound_ops[1].req = &getattr_req;
+
+	/* Send compound request */
+	ret = fuse_compound_send(fm, compound_ops, 2);
+
+	/* Process lookup result */
+	if (lookup_err || !lookup_out.nodeid) {
+		ret = lookup_err ? lookup_err : -ENOENT;
+		goto out;
+	}
+
+	fi = get_fuse_inode(inode);
+	if (lookup_out.nodeid != get_node_id(inode) ||
+	    (bool) IS_AUTOMOUNT(inode) != (bool) (lookup_out.attr.flags & FUSE_ATTR_SUBMOUNT)) {
+		fuse_queue_forget(fm->fc, forget, lookup_out.nodeid, 1);
+		forget = NULL;  /* Consumed by fuse_queue_forget */
+		ret = 0; /* invalidate */
+		goto out;
+	}
+
+	spin_lock(&fi->lock);
+	fi->nlookup++;
+	spin_unlock(&fi->lock);
+
+	if (fuse_invalid_attr(&lookup_out.attr) ||
+	    fuse_stale_inode(inode, lookup_out.generation, &lookup_out.attr)) {
+		ret = 0; /* invalidate */
+		goto out;
+	}
+
+	forget_all_cached_acls(inode);
+
+	/*
+	 * If GETATTR succeeded, use its attributes (more complete).
+	 * Otherwise, fall back to LOOKUP attributes.
+	 */
+	if (!getattr_err && !fuse_invalid_attr(&getattr_out.attr)) {
+		fuse_change_attributes(inode, &getattr_out.attr, NULL,
+				       ATTR_TIMEOUT(&getattr_out),
+				       attr_version);
+	} else {
+		fuse_change_attributes(inode, &lookup_out.attr, NULL,
+				       ATTR_TIMEOUT(&lookup_out),
+				       attr_version);
+	}
+
+	fuse_change_entry_timeout(entry, &lookup_out);
+	ret = 1; /* valid */
+
+out:
+	/* Only free if not consumed by fuse_queue_forget */
+	if (forget)
+		kfree(forget);
+	return ret;
+}
+
+/*
  * Check whether the dentry is still valid
  *
  * If the entry validity timeout has expired and the dentry is
@@ -413,13 +524,28 @@ static int fuse_dentry_revalidate(struct inode *dir, const struct qstr *name,
 			goto out;
 
 		fm = get_fuse_mount(inode);
+		attr_version = fuse_get_attr_version(fm->fc);
 
+		/*
+		 * Use compound LOOKUP+GETATTR if supported for more efficient
+		 * revalidation with fresher attributes in a single round-trip.
+		 */
+		if (fm->fc->compound_ops) {
+			ret = fuse_dentry_revalidate_compound(dir, name, entry,
+							      inode, fm,
+							      attr_version);
+			if (ret == -ENOMEM || ret == -EINTR)
+				goto out;
+			if (ret == 0)
+				goto invalid;
+			goto out; /* ret == 1, valid */
+		}
+
+		/* Fall back to simple LOOKUP if compounds not supported */
 		forget = fuse_alloc_forget();
 		ret = -ENOMEM;
 		if (!forget)
 			goto out;
-
-		attr_version = fuse_get_attr_version(fm->fc);
 
 		fuse_lookup_init(&args, get_node_id(dir), name, &outarg);
 		ret = fuse_simple_request(fm, &args);
