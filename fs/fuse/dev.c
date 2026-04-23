@@ -1847,15 +1847,24 @@ int fuse_copy_out_args(struct fuse_copy_state *cs, struct fuse_args *args,
 
 	reqsize += fuse_len_args(args->out_numargs, args->out_args);
 
-	if (reqsize < nbytes || (reqsize > nbytes && !args->out_argvar))
+	if (reqsize < nbytes)
 		return -EINVAL;
-	else if (reqsize > nbytes) {
+
+	if (args->out_argvar) {
 		struct fuse_arg *lastarg = &args->out_args[args->out_numargs-1];
 		unsigned diffsize = reqsize - nbytes;
 
 		if (diffsize > lastarg->size)
 			return -EINVAL;
 		lastarg->size -= diffsize;
+
+		if (args->out_var_alloc) {
+			lastarg->value = kvmalloc(lastarg->size, GFP_KERNEL);
+			if (!lastarg->value)
+				return -ENOMEM;
+		}
+	} else if (reqsize > nbytes) {
+		return -EINVAL;
 	}
 	return fuse_copy_args(cs, args->out_numargs, args->out_pages,
 			      args->out_args, args->page_zeroing);

@@ -8,6 +8,7 @@
 
 #include "dev.h"
 #include "fuse_i.h"
+#include "fusex.h"
 
 #include <linux/dax.h>
 #include <linux/pagemap.h>
@@ -31,7 +32,7 @@ MODULE_AUTHOR("Miklos Szeredi <miklos@szeredi.hu>");
 MODULE_DESCRIPTION("Filesystem in Userspace");
 MODULE_LICENSE("GPL");
 
-static struct kmem_cache *fuse_inode_cachep;
+struct kmem_cache *fuse_inode_cachep;
 struct list_head fuse_conn_list;
 DEFINE_MUTEX(fuse_mutex);
 
@@ -605,7 +606,7 @@ void fuse_unlock_inode(struct inode *inode, bool locked)
 		mutex_unlock(&get_fuse_inode(inode)->mutex);
 }
 
-static void fuse_umount_begin(struct super_block *sb)
+void fuse_umount_begin(struct super_block *sb)
 {
 	struct fuse_conn *fc = get_fuse_conn_super(sb);
 
@@ -631,7 +632,7 @@ static void fuse_send_destroy(struct fuse_mount *fm)
 	}
 }
 
-static void convert_fuse_statfs(struct kstatfs *stbuf, struct fuse_kstatfs *attr)
+void fuse_convert_statfs(struct kstatfs *stbuf, struct fuse_kstatfs *attr)
 {
 	stbuf->f_type    = FUSE_SUPER_MAGIC;
 	stbuf->f_bsize   = attr->bsize;
@@ -667,7 +668,7 @@ static int fuse_statfs(struct dentry *dentry, struct kstatfs *buf)
 	args.out_args[0].value = &outarg;
 	err = fuse_simple_request(fm, &args);
 	if (!err)
-		convert_fuse_statfs(buf, &outarg.st);
+		fuse_convert_statfs(buf, &outarg.st);
 	return err;
 }
 
@@ -2160,6 +2161,10 @@ static int __init fuse_init(void)
 	if (res)
 		goto err_sysfs_cleanup;
 
+	res = fusex_init();
+	if (res)
+		goto err_ctl_cleanup;
+
 	fuse_dentry_tree_init();
 
 	sanitize_global_limit(&max_user_bgreq);
@@ -2167,6 +2172,8 @@ static int __init fuse_init(void)
 
 	return 0;
 
+err_ctl_cleanup:
+	fuse_ctl_cleanup();
  err_sysfs_cleanup:
 	fuse_sysfs_cleanup();
  err_dev_cleanup:
@@ -2182,6 +2189,7 @@ static void __exit fuse_exit(void)
 	pr_debug("exit\n");
 
 	fuse_dentry_tree_cleanup();
+	fusex_cleanup();
 	fuse_ctl_cleanup();
 	fuse_sysfs_cleanup();
 	fuse_fs_cleanup();

@@ -69,6 +69,9 @@ extern struct mutex fuse_mutex;
 extern unsigned int max_user_bgreq;
 extern unsigned int max_user_congthresh;
 
+extern struct kmem_cache *fuse_inode_cachep;
+extern const struct address_space_operations fuse_symlink_aops;
+
 struct fuse_forget_link;
 
 /**
@@ -911,6 +914,8 @@ struct inode *fuse_iget(struct super_block *sb, u64 nodeid,
 int fuse_lookup_name(struct super_block *sb, u64 nodeid, const struct qstr *name,
 		     struct fuse_entry_out *outarg, struct inode **inode);
 
+void fuse_umount_begin(struct super_block *sb);
+
 /*
  * Initialize READ or READDIR request
  */
@@ -1102,6 +1107,7 @@ void fuse_ctl_remove_conn(struct fuse_conn *fc);
  * Is file type valid?
  */
 int fuse_valid_type(int m);
+bool fuse_valid_size(u64 size);
 
 bool fuse_invalid_attr(struct fuse_attr *attr);
 
@@ -1203,6 +1209,8 @@ struct posix_acl *fuse_get_acl(struct mnt_idmap *idmap,
 			       struct dentry *dentry, int type);
 int fuse_set_acl(struct mnt_idmap *, struct dentry *dentry,
 		 struct posix_acl *acl, int type);
+
+void fuse_convert_statfs(struct kstatfs *stbuf, struct fuse_kstatfs *attr);
 
 /* readdir.c */
 int fuse_readdir(struct file *file, struct dir_context *ctx);
