@@ -455,6 +455,9 @@ EXPORT_SYMBOL_GPL(fuse_dev_alloc);
 
 /*
  * Installs @fch into @fud, return true on success.  "Consumes" @pq in either case.
+ * If @fch->conn is NULL the channel is being installed before any fuse_conn
+ * exists (fusex SET_FD path); the conn reference is taken later when the
+ * conn is bound.
  */
 static bool fuse_dev_install_with_pq(struct fuse_dev *fud, struct fuse_chan *fch,
 				     struct list_head *pq)
@@ -482,7 +485,8 @@ static bool fuse_dev_install_with_pq(struct fuse_dev *fud, struct fuse_chan *fch
 		fud->pq.processing = pq;
 	}
 	list_add_tail(&fud->entry, &fch->devices);
-	fuse_conn_get(fch->conn);
+	if (fch->conn)
+		fuse_conn_get(fch->conn);
 	wake_up_all(&fuse_dev_waitq);
 	return true;
 }
@@ -521,12 +525,19 @@ void fuse_dev_put(struct fuse_dev *fud)
 
 	fch = fuse_dev_chan_get(fud);
 	if (fch && fch != FUSE_DEV_CHAN_DISCONNECTED) {
+		bool orphan;
+
 		/* This is the virtiofs case (fuse_dev_release() not called) */
 		spin_lock(&fch->lock);
 		list_del(&fud->entry);
+		/* Pre-mount install with no conn ever adopted → free chan */
+		orphan = !fch->conn && list_empty(&fch->devices);
 		spin_unlock(&fch->lock);
 
-		fuse_conn_put(fch->conn);
+		if (fch->conn)
+			fuse_conn_put(fch->conn);
+		else if (orphan)
+			fuse_chan_free(fch);
 	}
 	kfree(fud->pq.processing);
 	kfree(fud);
@@ -2152,6 +2163,27 @@ void fuse_chan_abort(struct fuse_chan *fch, bool abort_with_err)
 
 	fch->abort_with_err = abort_with_err;
 
+	/* Pre-mount install: nothing to drain, no conn for fuse_end_polls() */
+	if (!fch->conn) {
+		spin_lock(&fch->lock);
+		fch->connected = 0;
+		spin_unlock(&fch->lock);
+
+		/*
+		 * Tear down any ring entries the daemon registered before
+		 * CMD_CREATE adopted the channel. No mount means no in-flight
+		 * fs traffic, but mirror the bg_lock dance from the regular
+		 * path so fuse_uring_abort_end_requests()'s max_background
+		 * WARN stays quiet.
+		 */
+		spin_lock(&fch->bg_lock);
+		fch->max_background = UINT_MAX;
+		spin_unlock(&fch->bg_lock);
+
+		fuse_uring_abort(fch);
+		return;
+	}
+
 	spin_lock(&fch->lock);
 	if (fch->connected) {
 		struct fuse_dev *fud;
@@ -2261,7 +2293,22 @@ int fuse_dev_release(struct inode *inode, struct file *file)
 			WARN_ON(fch->iq.fasync != NULL);
 			fuse_chan_abort(fch, false);
 		}
-		fuse_conn_put(fch->conn);
+		/* NULL when channel installed pre-conn and CMD_CREATE never ran */
+		if (fch->conn) {
+			fuse_conn_put(fch->conn);
+		} else if (last) {
+			/*
+			 * Orphan: no conn ever adopted this channel, so the
+			 * regular fuse_conn_put -> delayed_release ->
+			 * fuse_uring_destruct() path will not run. Finish the
+			 * teardown started by fuse_chan_abort() and free the
+			 * channel (and any ring the daemon registered)
+			 * ourselves.
+			 */
+			fuse_uring_wait_stopped_queues(fch);
+			fuse_uring_destruct(fch);
+			fuse_chan_free(fch);
+		}
 	}
 	fuse_dev_put(fud);
 	return 0;

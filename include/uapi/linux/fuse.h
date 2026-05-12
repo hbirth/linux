@@ -776,11 +776,16 @@ enum fuse_mkobjx_flags {
 	FUSE_MKOBJX_TMPFILE = 1 << 0,
 };
 
+/*
+ * Control fields come before @stat so the offsetof(stat) bytes fit in the
+ * 128 B op_in slot of fuse_uring_req_header; the kernel splits this struct
+ * on the wire over io_uring (header in in_args[0], @stat in in_args[1]).
+ */
 struct fuse_mkobjx_in {
-	struct fuse_statx stat;
 	uint32_t	namesize;
 	uint32_t	flags;
 	uint64_t	spare[7];
+	struct fuse_statx stat;
 };
 
 struct fuse_mkdir_in {

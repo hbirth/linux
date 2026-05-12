@@ -3,6 +3,7 @@
 #include "fusex.h"
 #include "dev.h"
 #include "fuse_i.h"
+#include "fuse_dev_i.h"  /* fuse_dev_chan_get, FUSE_DEV_CHAN_DISCONNECTED */
 
 #include <linux/fs_context.h>
 #include <linux/miscdevice.h>
@@ -14,6 +15,7 @@
 #include <linux/statfs.h>
 #include <linux/falloc.h>
 #include <linux/fs_parser.h>
+#include <uapi/linux/magic.h>
 
 static void fusex_init_inode(struct inode *inode);
 
@@ -123,7 +125,10 @@ static void fusex_evict_inode(struct inode *inode)
 	truncate_inode_pages_final(&inode->i_data);
 	clear_inode(inode);
 	if (fi->forget) {
-		fuse_chan_queue_forget(fc->chan, fi->forget, fi->nodeid, 1);
+		if (fi->nodeid)
+			fuse_chan_queue_forget(fc->chan, fi->forget, fi->nodeid, 1);
+		else
+			kfree(fi->forget);
 		fi->forget = NULL;
 	}
 }
@@ -134,7 +139,9 @@ static int fusex_send_setstatx(struct inode *inode, struct fuse_setstatx_in *ina
 	struct fuse_statx_out outarg;
 
 	args.opcode = FUSE_SETSTATX;
-	ADD_IN_ARG_S(args, inarg);
+	/* Split header / stat so in_args[0] fits in io_uring's 128 B op_in */
+	ADD_IN_ARG(args, offsetof(struct fuse_setstatx_in, stat), inarg);
+	ADD_IN_ARG_S(args, &inarg->stat);
 	ADD_OUT_ARG_S(args, &outarg);
 
 	return fusex_inode_request(inode, &args);
@@ -305,7 +312,8 @@ static struct inode *fusex_get_inode(struct super_block *sb, struct fusex_id *id
 		return ERR_PTR(-ENOMEM);
 
 	if (inode_state_read_once(inode) & I_NEW) {
-		inode_state_set(inode, I_DONTCACHE);
+		/* I_NEW gives us exclusive ownership; i_lock not needed. */
+		inode_state_set_raw(inode, I_DONTCACHE);
 		err = fusex_send_statx(inode, &statx);
 		if (err) {
 			discard_new_inode(inode);
@@ -721,7 +729,7 @@ static void *fusex_send_lgxattr(struct inode *inode, const char *name, size_t *s
 
 	res = fusex_inode_request(inode, &args);
 	if (res < 0) {
-		kfree(args.out_args[0].value);
+		kvfree(args.out_args[0].value);
 		if (res == -ENOSYS)
 			res = -EOPNOTSUPP;
 		return ERR_PTR(res);
@@ -754,7 +762,7 @@ static char *fusex_send_listxattr(struct inode *inode, size_t *gotsize)
 		return list;
 
 	if (!fusex_verify_xattr_list(list, *gotsize)) {
-		kfree(list);
+		kvfree(list);
 		return ERR_PTR(-EIO);
 	}
 
@@ -765,7 +773,7 @@ static ssize_t fusex_listxattr(struct dentry *dentry, char *list, size_t size)
 {
 	struct inode *inode = d_inode(dentry);
 	ssize_t res;
-	char *gotlist __free(kfree) = fusex_send_listxattr(inode, &res);
+	char *gotlist __free(kvfree) = fusex_send_listxattr(inode, &res);
 
 	if (IS_ERR(gotlist))
 		return PTR_ERR(gotlist);
@@ -785,7 +793,7 @@ static struct posix_acl *fusex_get_acl(struct inode *inode, int type, bool rcu)
 	struct user_namespace *user_ns = i_user_ns(inode);
 	const char *name = posix_acl_xattr_name(type);
 	size_t size;
-	void *value __free(kfree) = fusex_send_lgxattr(inode, name, &size);
+	void *value __free(kvfree) = fusex_send_lgxattr(inode, name, &size);
 	struct posix_acl *acl = NULL;
 
 	WARN_ON(rcu);
@@ -933,7 +941,9 @@ static int fusex_send_mkobjx(struct inode *dir, struct inode *inode,
 	inarg.flags = flags;
 
 	args.opcode = FUSE_MKOBJX;
-	ADD_IN_ARG_S(args, &inarg);
+	/* Split header / stat so in_args[0] fits in io_uring's 128 B op_in */
+	ADD_IN_ARG(args, offsetof(struct fuse_mkobjx_in, stat), &inarg);
+	ADD_IN_ARG_S(args, &inarg.stat);
 	ADD_IN_ARG(args, inarg.namesize, name->name);
 	if (S_ISLNK(inode->i_mode))
 		ADD_IN_ARG(args, strlen(link_body) + 1, link_body);
@@ -978,6 +988,13 @@ static int fusex_do_mkobjx(struct inode *dir, struct inode *inode, const struct 
 	err = fusex_send_mkobjx(dir, inode, name, link_body, &id);
 	if (err)
 		return err;
+
+	/*
+	 * The server has minted a nodeid for us. Record it on the inode
+	 * immediately so that any failure below leaves the eviction path
+	 * able to send FORGET and reclaim the server-side reference.
+	 */
+	get_fuse_inode(inode)->nodeid = id.nodeid;
 
 	err = fusex_set_initial_acl(inode, &id, ACL_TYPE_ACCESS);
 	if (err)
@@ -1051,7 +1068,7 @@ static struct inode *fusex_new_inode(struct mnt_idmap *idmap, struct inode *dir,
 
 	err = fusex_do_mkobjx(dir, inode, name, link_body, &statx);
 	if (err)
-		goto iput_noforget;
+		goto iput;
 
 	err = fusex_setup_new_inode(inode, &statx.stat);
 	if (err) {
@@ -1062,10 +1079,17 @@ static struct inode *fusex_new_inode(struct mnt_idmap *idmap, struct inode *dir,
 	return inode;
 
 iput_noforget:
-	struct fuse_inode *fi = get_fuse_inode(inode);
+	{
+		struct fuse_inode *fi = get_fuse_inode(inode);
 
-	kfree(fi->forget);
-	fi->forget = NULL;
+		kfree(fi->forget);
+		fi->forget = NULL;
+	}
+iput:
+	/*
+	 * If MKOBJX succeeded fi->nodeid is set; eviction will FORGET it.
+	 * If MKOBJX itself failed fi->nodeid is 0 and evict skips FORGET.
+	 */
 	iput(inode);
 	return ERR_PTR(err);
 }
@@ -1337,6 +1361,7 @@ static int fusex_send_opendir(struct fuse_file *ff, struct inode *inode)
 	if (!err) {
 		ff->fh = outarg.fh;
 		ff->open_flags = FOPEN_CACHE_DIR;
+		ff->nodeid = get_node_id(inode);
 	}
 	return err;
 }
@@ -1469,7 +1494,7 @@ static int fusex_xattr_get(const struct xattr_handler *handler, struct dentry *d
 			   struct inode *inode, const char *name, void *buffer, size_t size)
 {
 	size_t attr_size;
-	void *value __free(kfree) =
+	void *value __free(kvfree) =
 		fusex_send_lgxattr(inode, name - strlen(handler->prefix), &attr_size);
 
 	if (IS_ERR(value))
@@ -1642,16 +1667,22 @@ static int fusex_get_tree(struct fs_context *fsc)
 	struct fuse_dev *fud = fsc->fs_private;
 	struct fuse_conn *fc __free(kfree) = kmalloc_obj(*fc);
 	struct fuse_mount *fm __free(kfree) = kzalloc_obj(*fm);
-	struct fuse_chan *fch __free(fuse_chan_free) = fuse_dev_chan_new();
+	/* Channel was installed at SET_FD so the daemon could pre-register
+	 * io_uring entries; pick it up and bind it to the freshly allocated fc.
+	 */
+	struct fuse_chan *fch = fuse_dev_chan_get(fud);
 
-	if (!fch || !fc || !fm)
+	if (!fc || !fm)
 		return -ENOMEM;
+	if (!fch || fch == FUSE_DEV_CHAN_DISCONNECTED)
+		return -EIO;
 
 	fc->release = fuse_free_conn;
 	fsc->s_fs_info = fm;
 	fuse_conn_init(no_free_ptr(fc), no_free_ptr(fm), fsc->user_ns, fch);
 	fuse_chan_set_initialized(fch, NULL);
-	fuse_dev_install(fud, no_free_ptr(fch));
+	/* Take the conn reference that fuse_dev_install() skipped at SET_FD */
+	fuse_conn_get(fch->conn);
 
 	return get_tree_nodev(fsc, fusex_fill_super);
 }
@@ -1679,7 +1710,9 @@ static int fusex_parse_param(struct fs_context *fsc, struct fs_parameter *param)
 		return opt;
 
 	switch (opt) {
-	case FUSEX_OPT_FD:
+	case FUSEX_OPT_FD: {
+		struct fuse_chan *fch;
+
 		if (param->type != fs_value_is_file)
 			return invalfc(fsc, "FSCONFIG_SET_FD is required for fd");
 		if (param->file->f_op != &fuse_dev_operations)
@@ -1692,8 +1725,23 @@ static int fusex_parse_param(struct fs_context *fsc, struct fs_parameter *param)
 			fuse_dev_put(fud);
 			return invalfc(fsc, "synchronous INIT is mandatory");
 		}
+		if (fuse_dev_is_installed(fud)) {
+			fuse_dev_put(fud);
+			return invalfc(fsc, "device already attached to a mount");
+		}
+
+		/* Install channel now so the daemon can pre-register io_uring
+		 * entries before CMD_CREATE; conn is bound in fusex_get_tree().
+		 */
+		fch = fuse_dev_chan_new();
+		if (!fch) {
+			fuse_dev_put(fud);
+			return -ENOMEM;
+		}
+		fuse_dev_install(fud, fch);
 		fsc->fs_private = fud;
 		break;
+	}
 
 	default:
 		return -EINVAL;

@@ -240,8 +240,17 @@ static struct fuse_ring *fuse_uring_create(struct fuse_chan *fch)
 	if (!ring->queues)
 		goto out_err;
 
-	max_payload_size = max(FUSE_MIN_READ_BUFFER, fch->max_write);
-	max_payload_size = max(max_payload_size, fch->max_pages * PAGE_SIZE);
+	/*
+	 * Pre-INIT register (boot-handshake-over-uring): max_write and
+	 * max_pages are 0; leave max_payload_sz = 0 and let
+	 * fuse_uring_create_ring_ent() latch it from iov[1].iov_len.
+	 */
+	max_payload_size = 0;
+	if (fch->max_write || fch->max_pages) {
+		max_payload_size = max(FUSE_MIN_READ_BUFFER, fch->max_write);
+		max_payload_size = max(max_payload_size,
+				       fch->max_pages * PAGE_SIZE);
+	}
 
 	spin_lock(&fch->lock);
 	if (fch->ring) {
@@ -1050,9 +1059,17 @@ fuse_uring_create_ring_ent(struct io_uring_cmd *cmd,
 	}
 
 	payload_size = iov[1].iov_len;
+	if (payload_size < FUSE_MIN_READ_BUFFER) {
+		pr_info_ratelimited("Invalid req payload len %zu (< %u)\n",
+				    payload_size, FUSE_MIN_READ_BUFFER);
+		return ERR_PTR(err);
+	}
+	/* Latch max_payload_sz from the first register when pre-INIT */
+	if (!ring->max_payload_sz)
+		cmpxchg(&ring->max_payload_sz, 0, payload_size);
 	if (payload_size < ring->max_payload_sz) {
-		pr_info_ratelimited("Invalid req payload len %zu\n",
-				    payload_size);
+		pr_info_ratelimited("Invalid req payload len %zu (< %zu)\n",
+				    payload_size, ring->max_payload_sz);
 		return ERR_PTR(err);
 	}
 
@@ -1116,6 +1133,12 @@ static int fuse_uring_register(struct io_uring_cmd *cmd,
 
 	fuse_uring_do_register(ent, cmd, issue_flags);
 
+	/* Latch io_uring on first register so fuse_block_alloc() sees it
+	 * before INIT runs (pre-INIT register path).
+	 */
+	if (!fch->io_uring)
+		fuse_chan_io_uring_enable(fch);
+
 	return 0;
 }
 
@@ -1157,12 +1180,9 @@ int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 	if (!fch->connected)
 		return -ENOTCONN;
 
-	/*
-	 * fuse_uring_register() needs the ring to be initialized,
-	 * we need to know the max payload size
+	/* fch->initialized may be 0 here: pre-CMD_CREATE register path takes
+	 * max_payload_sz from the daemon's iov[1] instead of fch->max_*.
 	 */
-	if (!fch->initialized)
-		return -EAGAIN;
 
 	switch (cmd_op) {
 	case FUSE_IO_URING_CMD_REGISTER:

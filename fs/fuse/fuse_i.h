@@ -999,7 +999,7 @@ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 u32 fuse_get_cache_mask(struct inode *inode);
 
 int fuse_ctl_init(void);
-void __exit fuse_ctl_cleanup(void);
+void fuse_ctl_cleanup(void);
 
 /*
  * Simple request sending that does request allocation and freeing
