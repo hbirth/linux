@@ -142,6 +142,8 @@ void fuse_uring_queue_fuse_req(struct fuse_iqueue *fiq, struct fuse_req *req);
 bool fuse_uring_queue_bq_req(struct fuse_req *req);
 bool fuse_uring_remove_pending_req(struct fuse_req *req);
 bool fuse_uring_request_expired(struct fuse_chan *fch);
+void fuse_uring_send_forget(struct fuse_iqueue *fiq,
+			    struct fuse_forget_link *link);
 
 static inline void fuse_uring_abort(struct fuse_chan *fch)
 {
@@ -183,6 +185,13 @@ static inline void fuse_uring_wait_stopped_queues(struct fuse_chan *fch)
 static inline bool fuse_uring_ready(struct fuse_chan *fch)
 {
 	return false;
+}
+
+static inline void fuse_uring_send_forget(struct fuse_iqueue *fiq,
+					   struct fuse_forget_link *link)
+{
+	/* Without io_uring support, fall through to the legacy enqueue path. */
+	fuse_dev_queue_forget(fiq, link);
 }
 
 static inline bool fuse_uring_remove_pending_req(struct fuse_req *req)

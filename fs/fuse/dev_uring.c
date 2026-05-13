@@ -1288,6 +1288,83 @@ static void fuse_uring_dispatch_ent(struct fuse_ring_ent *ent)
 	io_uring_cmd_complete_in_task(cmd, fuse_uring_send_in_task);
 }
 
+/*
+ * FUSE_FORGET delivery for io_uring transport.
+ *
+ * Exposed for fusex, which installs a private fuse_iqueue_ops table
+ * that routes FORGETs through here. The default fuse-over-io_uring
+ * ops still point .send_forget at fuse_dev_queue_forget() to preserve
+ * existing daemon behaviour for non-fusex mounts.
+ *
+ * The legacy /dev/fuse path consumes fiq->forget_list_head inside the
+ * char-dev read() loop (see fuse_read_forget()). Under io_uring the
+ * daemon never reads /dev/fuse, so leaving send_forget pointed at
+ * fuse_dev_queue_forget() means the list grows without bound and the
+ * daemon keeps per-nodeid state (open fds, caches, …) forever. Instead
+ * we synthesize a FUSE_FORGET request and submit it through the same
+ * ring path as regular requests; the daemon receives it via
+ * COMMIT_AND_FETCH and we drop the link.
+ *
+ * args + inarg are heap-allocated and freed by the .end callback once
+ * the daemon has acked the request (or the conn was torn down).
+ */
+struct fuse_uring_forget_req {
+	struct fuse_args     args;
+	struct fuse_forget_in inarg;
+};
+
+static void fuse_uring_forget_end(struct fuse_args *args, int error)
+{
+	(void)error;
+	kfree(container_of(args, struct fuse_uring_forget_req, args));
+}
+
+void fuse_uring_send_forget(struct fuse_iqueue *fiq,
+			    struct fuse_forget_link *link)
+{
+	struct fuse_chan *fch = container_of(fiq, struct fuse_chan, iq);
+	struct fuse_uring_forget_req *fr;
+
+	/*
+	 * GFP_NOFS: send_forget is reached from fusex_evict_inode() and
+	 * other VFS-eviction contexts where recursing into the filesystem
+	 * to free memory would deadlock.
+	 */
+	fr = kzalloc(sizeof(*fr), GFP_NOFS);
+	if (!fr) {
+		/*
+		 * Out of memory: drop the FORGET. The daemon will keep the
+		 * nodeid alive until unmount; better than crashing.
+		 */
+		kfree(link);
+		return;
+	}
+
+	fr->inarg.nlookup       = link->forget_one.nlookup;
+	fr->args.opcode         = FUSE_FORGET;
+	fr->args.nodeid         = link->forget_one.nodeid;
+	fr->args.in_numargs     = 1;
+	fr->args.in_args[0].size  = sizeof(fr->inarg);
+	fr->args.in_args[0].value = &fr->inarg;
+	/* force: skip cred filling + the connected/blocked checks. */
+	fr->args.force          = true;
+	/* noreply: the daemon's COMMIT_AND_FETCH carries no payload. */
+	fr->args.noreply        = true;
+	/* nocreds pairs with force; FORGET has no caller context anyway. */
+	fr->args.nocreds        = true;
+	fr->args.end            = fuse_uring_forget_end;
+
+	kfree(link);
+
+	if (fuse_chan_send_bg(fch, &fr->args, GFP_NOFS) < 0) {
+		/*
+		 * Channel is gone (umount/abort). The .end callback won't
+		 * fire — release the allocation ourselves.
+		 */
+		kfree(fr);
+	}
+}
+
 /* queue a fuse request and send it if a ring entry is available */
 void fuse_uring_queue_fuse_req(struct fuse_iqueue *fiq, struct fuse_req *req)
 {
@@ -1391,7 +1468,11 @@ bool fuse_uring_remove_pending_req(struct fuse_req *req)
 }
 
 static const struct fuse_iqueue_ops fuse_io_uring_ops = {
-	/* should be send over io-uring as enhancement */
+	/* should be send over io-uring as enhancement;
+	 * fusex installs its own ops table (see fusex.c) that routes
+	 * FORGET via fuse_uring_send_forget() over the rings. Generic
+	 * fuse-over-io_uring mounts keep the legacy enqueue path.
+	 */
 	.send_forget = fuse_dev_queue_forget,
 
 	/*

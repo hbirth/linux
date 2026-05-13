@@ -4,6 +4,7 @@
 #include "dev.h"
 #include "fuse_i.h"
 #include "fuse_dev_i.h"  /* fuse_dev_chan_get, FUSE_DEV_CHAN_DISCONNECTED */
+#include "dev_uring_i.h" /* fuse_uring_send_forget, fuse_uring_queue_fuse_req */
 
 #include <linux/fs_context.h>
 #include <linux/miscdevice.h>
@@ -194,6 +195,24 @@ static const struct super_operations fusex_super_operations = {
 	.write_inode	= fusex_write_inode,
 	.umount_begin	= fuse_umount_begin,
 	.statfs		= fusex_statfs,
+};
+
+/*
+ * fusex_io_uring_ops
+ *
+ * Identical to the generic fuse_io_uring_ops registered by dev_uring.c
+ * except .send_forget is routed through fuse_uring_send_forget() so
+ * FUSE_FORGET travels over the rings. We install this on the channel's
+ * iqueue in fusex_get_tree(), which runs after the daemon's REGISTER
+ * cmds have completed (fuse_uring_register() has already swapped fiq->ops
+ * to the generic table by that point — we overwrite it). Other
+ * fuse-over-io_uring filesystems keep the generic ops and the legacy
+ * enqueue-only FORGET behaviour.
+ */
+static const struct fuse_iqueue_ops fusex_io_uring_ops = {
+	.send_forget    = fuse_uring_send_forget,
+	.send_interrupt = fuse_dev_queue_interrupt,
+	.send_req       = fuse_uring_queue_fuse_req,
 };
 
 static void fusex_set_times(struct inode *inode, struct fuse_statx *attr)
@@ -1759,6 +1778,18 @@ static int fusex_get_tree(struct fs_context *fsc)
 	fuse_chan_set_initialized(fch, NULL);
 	/* Take the conn reference that fuse_dev_install() skipped at SET_FD */
 	fuse_conn_get(fch->conn);
+
+	/*
+	 * Override the generic fuse-over-io_uring iqueue ops so FORGETs
+	 * travel through the rings instead of accumulating on the legacy
+	 * fiq->forget_list. fuse_uring_register() set fch->iq.ops while
+	 * the daemon was REGISTERing entries; that swap is complete by the
+	 * time the daemon issues CMD_CREATE (which is what triggers this
+	 * function), so this write races with nothing. No FORGETs can
+	 * fire yet either — fusex_fill_super() has not even sent INIT.
+	 */
+	if (fuse_uring_ready(fch))
+		WRITE_ONCE(fch->iq.ops, &fusex_io_uring_ops);
 
 	return get_tree_nodev(fsc, fusex_fill_super);
 }
