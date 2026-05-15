@@ -1892,9 +1892,11 @@ static void fusex_kill_sb_anon(struct super_block *sb)
 {
 	struct fuse_mount *fm = get_fuse_mount_super(sb);
 
+	if (sb->s_root) {
+		if (fuse_mount_remove(fm))
+			fuse_conn_destroy(fm);
+	}
 	kill_anon_super(sb);
-	fuse_conn_destroy(fm);
-	fuse_mount_remove(fm);
 	fuse_mount_destroy(fm);
 }
 
