@@ -1759,10 +1759,19 @@ static int fusex_get_tree(struct fs_context *fsc)
 	struct fuse_dev *fud = fsc->fs_private;
 	struct fuse_conn *fc __free(kfree) = kmalloc_obj(*fc);
 	struct fuse_mount *fm __free(kfree) = kzalloc_obj(*fm);
+	struct fuse_chan *fch;
+
+	/* Legacy mount(2) bypasses fsconfig() so the FSCONFIG_SET_FD case in
+	 * fusex_parse_param() never ran and fs_private is NULL. Reject cleanly
+	 * instead of dereferencing it in fuse_dev_chan_get() below.
+	 */
+	if (!fud)
+		return invalfc(fsc, "fusex requires fsconfig(FSCONFIG_SET_FD); legacy mount(2) is not supported");
+
 	/* Channel was installed at SET_FD so the daemon could pre-register
 	 * io_uring entries; pick it up and bind it to the freshly allocated fc.
 	 */
-	struct fuse_chan *fch = fuse_dev_chan_get(fud);
+	fch = fuse_dev_chan_get(fud);
 
 	if (!fc || !fm)
 		return -ENOMEM;
