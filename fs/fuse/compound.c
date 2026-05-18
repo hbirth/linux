@@ -17,8 +17,6 @@
 static void fuse_compound_propagate_nodeid(struct fuse_args *dep,
 					   const struct fuse_args *src)
 {
-	const struct fuse_entry_out *entry_out;
-
 	if (src->out_numargs == 0)
 		return;
 
@@ -29,11 +27,21 @@ static void fuse_compound_propagate_nodeid(struct fuse_args *dep,
 	case FUSE_SYMLINK:
 	case FUSE_LINK:
 	case FUSE_CREATE:
-	case FUSE_TMPFILE:
-		entry_out = src->out_args[0].value;
-		if (entry_out)
-			dep->nodeid = entry_out->nodeid;
+	case FUSE_TMPFILE: {
+		const struct fuse_entry_out *eo = src->out_args[0].value;
+
+		if (eo)
+			dep->nodeid = eo->nodeid;
 		break;
+	}
+	case FUSE_LOOKUPX:
+	case FUSE_MKOBJX: {
+		const struct fuse_entryx_out *eo = src->out_args[0].value;
+
+		if (eo)
+			dep->nodeid = eo->nodeid;
+		break;
+	}
 	}
 }
 
