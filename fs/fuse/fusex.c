@@ -469,36 +469,55 @@ static const struct file_operations fusex_fops_writeback = {
 	.release	= fusex_file_release,
 };
 
-static int fusex_send_read(struct inode *inode, loff_t pos, struct file *file,
-			   struct folio *folio, unsigned int off, unsigned int len)
+/*
+ * Dispatch a FUSE_READ for one or more contiguous folios starting at
+ * @pos, totalling @total_len bytes. Returns the actual number of bytes
+ * the daemon delivered (may be < total_len at EOF); the caller is
+ * responsible for zero-filling any short tail.
+ */
+static ssize_t fusex_send_reads(struct inode *inode, loff_t pos, u64 fh,
+				unsigned int flags, struct folio **folios,
+				struct fuse_folio_desc *descs,
+				unsigned int nfolios, size_t total_len)
 {
 	struct fuse_args_pages ap = {};
-	struct fuse_folio_desc desc = { .offset = off, .length = len };
 	struct fuse_read_in inarg;
 	ssize_t res;
 
 	memset(&inarg, 0, sizeof(inarg));
-	inarg.fh = fusex_file_fh(file);
+	inarg.fh = fh;
 	inarg.offset = pos;
-	inarg.size = len;
-	inarg.flags = file ? file->f_flags : 0;
+	inarg.size = total_len;
+	inarg.flags = flags;
+
 	ap.args.opcode = FUSE_READ;
 	ADD_IN_ARG_S(ap.args, &inarg);
-	ADD_OUT_ARG(ap.args, len, NULL);
+	ADD_OUT_ARG(ap.args, total_len, NULL);
 	ap.args.out_argvar = true;
 	ap.args.out_pages = true;
-	ap.num_folios = 1;
-	ap.folios = &folio;
-	ap.descs = &desc;
+	ap.num_folios = nfolios;
+	ap.folios = folios;
+	ap.descs = descs;
 
 	res = fusex_inode_request(inode, &ap.args);
 	if (res < 0)
 		return res;
+	WARN_ON(res > total_len);
+	return res;
+}
 
-	WARN_ON(res > len);
+static int fusex_send_read(struct inode *inode, loff_t pos, struct file *file,
+			   struct folio *folio, unsigned int off, unsigned int len)
+{
+	struct fuse_folio_desc desc = { .offset = off, .length = len };
+	ssize_t res = fusex_send_reads(inode, pos, fusex_file_fh(file),
+				       file ? file->f_flags : 0,
+				       &folio, &desc, 1, len);
+
+	if (res < 0)
+		return res;
 	if (res < len)
 		folio_zero_segment(folio, off + res, off + len);
-
 	return 0;
 }
 
@@ -531,6 +550,102 @@ static int fusex_read_folio(struct file *file, struct folio *folio)
 
 	folio_unlock(folio);
 	return err;
+}
+
+static void fusex_readahead(struct readahead_control *rac)
+{
+	struct inode *inode = rac->mapping->host;
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct file *file = rac->file;
+	const u64 fh = fusex_file_fh(file);
+	const unsigned int rflags = file ? file->f_flags : 0;
+	const loff_t i_size = i_size_read(inode);
+	const unsigned int max_folios = min_t(unsigned int, fc->max_pages, 256);
+	struct folio **folios __free(kfree) =
+		kmalloc_array(max_folios, sizeof(*folios), GFP_KERNEL);
+	struct fuse_folio_desc *descs __free(kfree) =
+		kmalloc_array(max_folios, sizeof(*descs), GFP_KERNEL);
+	struct folio *folio;
+
+	if (!folios || !descs)
+		return;
+
+	while ((folio = readahead_folio(rac)) != NULL) {
+		loff_t batch_pos = folio_pos(folio);
+		size_t batch_len;
+		size_t full_len = folio_size(folio), len = full_len;
+		unsigned int n;
+		ssize_t got;
+
+		if (batch_pos >= i_size) {
+			folio_unlock(folio);
+			continue;
+		}
+		if (i_size < batch_pos + full_len) {
+			len = i_size - batch_pos;
+			folio_zero_segment(folio, len, full_len);
+		}
+		folios[0] = folio;
+		descs[0].offset = 0;
+		descs[0].length = len;
+		batch_len = len;
+		n = 1;
+
+		/* Coalesce as many contiguous follow-up folios as fit. */
+		while (n < max_folios) {
+			loff_t next_pos = batch_pos + (loff_t)batch_len;
+			struct folio *nf;
+
+			if (next_pos >= i_size)
+				break;
+			nf = readahead_folio(rac);
+			if (!nf)
+				break;
+			full_len = folio_size(nf);
+			len = full_len;
+			if (i_size < next_pos + full_len) {
+				len = i_size - next_pos;
+				folio_zero_segment(nf, len, full_len);
+			}
+			folios[n] = nf;
+			descs[n].offset = 0;
+			descs[n].length = len;
+			batch_len += len;
+			n++;
+		}
+
+		got = fusex_send_reads(inode, batch_pos, fh, rflags,
+				       folios, descs, n, batch_len);
+		if (got < 0) {
+			unsigned int i;
+			for (i = 0; i < n; i++)
+				folio_unlock(folios[i]);
+			break;
+		}
+		/* Zero any tail the daemon didn't deliver. */
+		if ((size_t)got < batch_len) {
+			size_t consumed = 0;
+			unsigned int i;
+			for (i = 0; i < n; i++) {
+				size_t flen = descs[i].length;
+				if (consumed + flen <= (size_t)got) {
+					consumed += flen;
+					continue;
+				}
+				if (consumed < (size_t)got) {
+					unsigned int part = (size_t)got - consumed;
+					folio_zero_segment(folios[i], part, flen);
+					consumed = got;
+				} else {
+					folio_zero_segment(folios[i], 0, flen);
+				}
+			}
+		}
+		for (unsigned int i = 0; i < n; i++) {
+			folio_mark_uptodate(folios[i]);
+			folio_unlock(folios[i]);
+		}
+	}
 }
 
 /*
@@ -805,6 +920,7 @@ static ssize_t fusex_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
  */
 static const struct address_space_operations fusex_aops_writeback = {
 	.read_folio	= fusex_read_folio,
+	.readahead	= fusex_readahead,
 	.writepages	= fusex_writepages,
 	.write_begin	= fusex_write_begin,
 	.write_end	= fusex_write_end,
