@@ -19,6 +19,7 @@
 
 struct fuse_arg;
 struct fuse_args;
+struct fuse_compound_args;
 struct fuse_pqueue;
 struct fuse_iqueue;
 
@@ -383,6 +384,12 @@ int fuse_copy_args(struct fuse_copy_state *cs, unsigned int numargs,
 		   int zeroing);
 int fuse_copy_out_args(struct fuse_copy_state *cs, struct fuse_args *args,
 		       unsigned int nbytes);
+int fuse_copy_compound_in_args(struct fuse_copy_state *cs,
+			       struct fuse_compound_args *compound);
+int fuse_copy_compound_out_args(struct fuse_copy_state *cs,
+				struct fuse_compound_args *compound);
+void fuse_set_req_len(struct fuse_req *req);
+size_t fuse_compound_req_size(struct fuse_compound_args *compound);
 void fuse_dev_queue_forget(struct fuse_iqueue *fiq,
 			   struct fuse_forget_link *forget);
 void fuse_dev_queue_interrupt(struct fuse_iqueue *fiq, struct fuse_req *req);

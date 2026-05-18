@@ -572,11 +572,47 @@ struct fuse_dev *fuse_dev_grab(struct file *file)
 	return fud;
 }
 
+static inline struct fuse_compound_args *
+fuse_get_compound_args(struct fuse_args *args)
+{
+	if (args->opcode == FUSE_COMPOUND)
+		return container_of(args, struct fuse_compound_args, args);
+	return NULL;
+}
+
+size_t fuse_compound_req_size(struct fuse_compound_args *compound)
+{
+	size_t total = sizeof(struct fuse_in_header) +
+		       sizeof(struct fuse_compound_in);
+	unsigned int i, j;
+
+	for (i = 0; i < compound->count; i++) {
+		struct fuse_args *op_args = compound->ops[i].arg;
+
+		total += sizeof(struct fuse_compound_req_in) +
+			 sizeof(struct fuse_in_header);
+		for (j = 0; j < op_args->in_numargs; j++)
+			total += op_args->in_args[j].size;
+	}
+
+	return total;
+}
+
+void fuse_set_req_len(struct fuse_req *req)
+{
+	struct fuse_compound_args *compound = fuse_get_compound_args(req->args);
+
+	if (compound)
+		req->in.h.len = fuse_compound_req_size(compound);
+	else
+		req->in.h.len = sizeof(struct fuse_in_header) +
+			fuse_len_args(req->args->in_numargs,
+				      (struct fuse_arg *)req->args->in_args);
+}
+
 static void fuse_send_one(struct fuse_iqueue *fiq, struct fuse_req *req)
 {
-	req->in.h.len = sizeof(struct fuse_in_header) +
-		fuse_len_args(req->args->in_numargs,
-			      (struct fuse_arg *) req->args->in_args);
+	fuse_set_req_len(req);
 	fiq->ops->send_req(fiq, req);
 }
 
@@ -851,9 +887,7 @@ static bool fuse_request_queue_background_uring(struct fuse_req *req)
 {
 	struct fuse_iqueue *fiq = &req->chan->iq;
 
-	req->in.h.len = sizeof(struct fuse_in_header) +
-		fuse_len_args(req->args->in_numargs,
-			      (struct fuse_arg *) req->args->in_args);
+	fuse_set_req_len(req);
 	fuse_request_assign_unique(fiq, req);
 
 	return fuse_uring_queue_bq_req(req);
@@ -1532,6 +1566,52 @@ __releases(fiq->lock)
 }
 
 /*
+ * Stream the body of a compound request directly from the per-subop
+ * argument buffers, avoiding a pre-built linear copy.
+ */
+int fuse_copy_compound_in_args(struct fuse_copy_state *cs,
+			       struct fuse_compound_args *compound)
+{
+	unsigned int i, j;
+	int err;
+
+	err = fuse_copy_one(cs, &compound->in_header,
+			    sizeof(compound->in_header));
+	if (err)
+		return err;
+
+	for (i = 0; i < compound->count; i++) {
+		struct fuse_compound_arg *op = &compound->ops[i];
+		struct fuse_args *op_args = op->arg;
+		struct fuse_compound_req_in sub = {
+			.dep_index = op->dep_index,
+		};
+		struct fuse_in_header hdr = {
+			.unique	= i,
+			.opcode	= op_args->opcode,
+			.nodeid	= op_args->nodeid,
+			.len	= sizeof(hdr),
+		};
+
+		for (j = 0; j < op_args->in_numargs; j++)
+			hdr.len += op_args->in_args[j].size;
+
+		err = fuse_copy_one(cs, &sub, sizeof(sub));
+		if (!err)
+			err = fuse_copy_one(cs, &hdr, sizeof(hdr));
+		if (!err)
+			err = fuse_copy_args(cs, op_args->in_numargs,
+					     op_args->in_pages,
+					     (struct fuse_arg *)op_args->in_args,
+					     0);
+		if (err)
+			return err;
+	}
+
+	return 0;
+}
+
+/*
  * Read a single request into the userspace filesystem's buffer.  This
  * function waits until a request is available, then removes it from
  * the pending list and copies request data to userspace buffer.  If
@@ -1635,9 +1715,15 @@ static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
 	spin_unlock(&fpq->lock);
 	cs->req = req;
 	err = fuse_copy_one(cs, &req->in.h, sizeof(req->in.h));
-	if (!err)
-		err = fuse_copy_args(cs, args->in_numargs, args->in_pages,
-				     (struct fuse_arg *) args->in_args, 0);
+	if (!err) {
+		struct fuse_compound_args *compound = fuse_get_compound_args(args);
+
+		if (compound)
+			err = fuse_copy_compound_in_args(cs, compound);
+		else
+			err = fuse_copy_args(cs, args->in_numargs, args->in_pages,
+					     (struct fuse_arg *)args->in_args, 0);
+	}
 	fuse_copy_finish(cs);
 	spin_lock(&fpq->lock);
 	clear_bit(FR_LOCKED, &req->flags);
@@ -1844,6 +1930,41 @@ struct fuse_req *fuse_request_find(struct fuse_pqueue *fpq, u64 unique)
 	return NULL;
 }
 
+int fuse_copy_compound_out_args(struct fuse_copy_state *cs,
+				struct fuse_compound_args *compound)
+{
+	unsigned int i;
+	int err;
+
+	err = fuse_copy_one(cs, &compound->out_header,
+			    sizeof(compound->out_header));
+	if (err)
+		return err;
+
+	for (i = 0; i < compound->count; i++) {
+		struct fuse_compound_arg *op = &compound->ops[i];
+		struct fuse_out_header op_hdr;
+
+		err = fuse_copy_one(cs, &op_hdr, sizeof(op_hdr));
+		if (err)
+			return err;
+		if (op_hdr.len < sizeof(op_hdr))
+			return -EIO;
+
+		*op->error = op_hdr.error;
+		if (!op_hdr.error) {
+			err = fuse_copy_args(cs, op->arg->out_numargs,
+					     op->arg->out_pages,
+					     (struct fuse_arg *)op->arg->out_args,
+					     op->arg->page_zeroing);
+			if (err)
+				return err;
+		}
+	}
+
+	return 0;
+}
+
 int fuse_copy_out_args(struct fuse_copy_state *cs, struct fuse_args *args,
 		       unsigned nbytes)
 {
@@ -1971,10 +2092,16 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
 	if (!req->args->page_replace)
 		cs->move_folios = false;
 
-	if (oh.error)
+	if (oh.error) {
 		err = nbytes != sizeof(oh) ? -EINVAL : 0;
-	else
-		err = fuse_copy_out_args(cs, req->args, nbytes);
+	} else {
+		struct fuse_compound_args *compound = fuse_get_compound_args(req->args);
+
+		if (compound)
+			err = fuse_copy_compound_out_args(cs, compound);
+		else
+			err = fuse_copy_out_args(cs, req->args, nbytes);
+	}
 	fuse_copy_finish(cs);
 
 	spin_lock(&fpq->lock);

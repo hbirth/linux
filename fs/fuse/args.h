@@ -4,6 +4,7 @@
 #define _FS_FUSE_ARGS_H
 
 #include <linux/types.h>
+#include <linux/fuse.h>
 
 struct fuse_mount;
 
@@ -61,6 +62,32 @@ struct fuse_args_pages {
 	struct folio **folios;
 	struct fuse_folio_desc *descs;
 	unsigned int num_folios;
+};
+
+/*
+ * One subrequest in a compound.  @dep_index is FUSE_COMPOUND_NO_DEP, or
+ * the index of an earlier op in the array whose output should be used to
+ * fill in this op's nodeid before dispatch.  @error receives the per-op
+ * status after fuse_compound_send() returns.
+ */
+struct fuse_compound_arg {
+	struct fuse_args	*arg;
+	int			*error;
+	u8			dep_index;
+};
+
+/*
+ * Compound wrapper.  Embeds fuse_args as the first member so the device
+ * layer can container_of() back to the operation array.  The in_header
+ * and out_header fields are reserved-only today but reach the wire so
+ * future extensions can attach compound-level metadata.
+ */
+struct fuse_compound_args {
+	struct fuse_args	args;
+	struct fuse_compound_arg *ops;
+	unsigned int		count;
+	struct fuse_compound_in	 in_header;
+	struct fuse_compound_out out_header;
 };
 
 #endif /* _FS_FUSE_ARGS_H */

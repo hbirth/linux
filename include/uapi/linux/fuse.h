@@ -667,6 +667,12 @@ enum fuse_opcode {
 	FUSE_LOOKUPX		= 55,
 	FUSE_MKOBJX		= 56,
 	FUSE_SETSTATX		= 58,
+	/* A compound request is handled like a single request,
+	 * but contains multiple requests as input.
+	 * This can be used to signal to the fuse server that
+	 * the requests can be combined atomically.
+	 */
+	FUSE_COMPOUND		= 60,
 
 	/* CUSE specific operations */
 	CUSE_INIT		= 4096,
@@ -1284,6 +1290,53 @@ struct fuse_ext_header {
 struct fuse_supp_groups {
 	uint32_t	nr_groups;
 	uint32_t	groups[];
+};
+
+/*
+ * Sentinel value for fuse_compound_req_in.dep_index meaning the
+ * subrequest does not depend on any other subrequest.
+ */
+#define FUSE_COMPOUND_NO_DEP	0xff
+
+/*
+ * Compound request layout:
+ *
+ *	fuse_in_header (opcode FUSE_COMPOUND)
+ *	fuse_compound_in
+ *	  fuse_compound_req_in
+ *	  fuse_in_header
+ *	  payload
+ *	  ... (repeated per subrequest)
+ *
+ * The compound reply layout mirrors it:
+ *
+ *	fuse_out_header
+ *	fuse_compound_out
+ *	  fuse_out_header
+ *	  payload
+ *	  ... (repeated per subrequest)
+ *
+ * fuse_compound_in / fuse_compound_out currently only carry reserved
+ * fields; they exist so future extensions can attach compound-level
+ * metadata without another wire-format change.
+ */
+struct fuse_compound_in {
+	uint64_t	reserved[2];
+};
+
+struct fuse_compound_out {
+	uint64_t	reserved[2];
+};
+
+/*
+ * Per-subrequest header.  dep_index identifies an earlier subrequest in
+ * the same compound whose output should be threaded into this one's
+ * input (currently only the producing op's nodeid is propagated), or
+ * FUSE_COMPOUND_NO_DEP if the subrequest is independent.
+ */
+struct fuse_compound_req_in {
+	uint8_t		dep_index;
+	uint8_t		reserved[3];
 };
 
 /**

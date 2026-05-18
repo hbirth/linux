@@ -603,7 +603,14 @@ static int fuse_uring_copy_from_ring(struct fuse_ring *ring,
 	cs.is_uring = true;
 	cs.req = req;
 
-	err = fuse_copy_out_args(&cs, args, ring_in_out.payload_sz);
+	if (args->opcode == FUSE_COMPOUND) {
+		/* Stream compound response directly into operation buffers */
+		struct fuse_compound_args *compound =
+			container_of(args, struct fuse_compound_args, args);
+		err = fuse_copy_compound_out_args(&cs, compound);
+	} else {
+		err = fuse_copy_out_args(&cs, args, ring_in_out.payload_sz);
+	}
 	fuse_copy_finish(&cs);
 	return err;
 }
@@ -635,30 +642,35 @@ static int fuse_uring_args_to_ring(struct fuse_ring *ring, struct fuse_req *req,
 	cs.is_uring = true;
 	cs.req = req;
 
-	if (num_args > 0) {
-		/*
-		 * Expectation is that the first argument is the per op header.
-		 * Some op code have that as zero size.
-		 */
-		if (args->in_args[0].size > 0) {
-			err = copy_to_user(&ent->headers->op_in, in_args->value,
-					   in_args->size);
-			if (err) {
-				pr_info_ratelimited(
-					"Copying the header failed.\n");
-				return -EFAULT;
-			}
-		}
-		in_args++;
-		num_args--;
-	}
+	if (args->opcode == FUSE_COMPOUND) {
+		struct fuse_compound_args *compound =
+			container_of(args, struct fuse_compound_args, args);
 
-	/* copy the payload */
-	err = fuse_copy_args(&cs, num_args, args->in_pages,
-			     (struct fuse_arg *)in_args, 0);
+		err = fuse_copy_compound_in_args(&cs, compound);
+	} else {
+		if (num_args > 0) {
+			/*
+			 * Expectation is that the first argument is the per op header.
+			 * Some op code have that as zero size.
+			 */
+			if (args->in_args[0].size > 0) {
+				err = copy_to_user(&ent->headers->op_in, in_args->value,
+						   in_args->size);
+				if (err) {
+					pr_info_ratelimited("Copying the header failed.\n");
+					return -EFAULT;
+				}
+			}
+			in_args++;
+			num_args--;
+		}
+
+		err = fuse_copy_args(&cs, num_args, args->in_pages,
+				     (struct fuse_arg *)in_args, 0);
+	}
 	fuse_copy_finish(&cs);
 	if (err) {
-		pr_info_ratelimited("%s fuse_copy_args failed\n", __func__);
+		pr_info_ratelimited("%s payload copy failed\n", __func__);
 		return err;
 	}
 
@@ -1288,6 +1300,9 @@ void fuse_uring_queue_fuse_req(struct fuse_iqueue *fiq, struct fuse_req *req)
 	queue = fuse_uring_task_to_queue(ring);
 	if (!queue)
 		goto err;
+
+	/* Set request length before assigning unique ID */
+	fuse_set_req_len(req);
 
 	fuse_request_assign_unique(fiq, req);
 

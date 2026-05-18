@@ -701,6 +701,9 @@ struct fuse_conn {
 	/** @passthrough: Passthrough support for read/write IO */
 	unsigned int passthrough:1;
 
+	/** @compound_ops: does the fuse server support compound operations? */
+	unsigned int compound_ops:1;
+
 	/** @use_pages_for_kvec_io: Use pages instead of pointer for kernel I/O */
 	unsigned int use_pages_for_kvec_io:1;
 
@@ -1023,6 +1026,9 @@ static inline ssize_t fuse_simple_idmap_request(struct mnt_idmap *idmap,
 int fuse_simple_background(struct fuse_mount *fm, struct fuse_args *args,
 			   gfp_t gfp_flags);
 int fuse_simple_notify_reply(struct fuse_mount *fm, struct fuse_args *args, u64 unique);
+
+ssize_t fuse_compound_send(struct fuse_mount *fm,
+			   struct fuse_compound_arg *ops, unsigned int count);
 
 void fuse_dentry_tree_init(void);
 void fuse_dentry_tree_cleanup(void);
