@@ -1641,11 +1641,8 @@ static int fusex_send_init(struct fuse_mount *fm, struct fusex_id *id,
 	struct fuse_init_out outarg_in;
 	struct fuse_entryx_out outarg_lr;
 	struct fuse_statx_in inarg_sx;
-	u64 flags = FUSE_INIT_EXT;
+	u64 flags = FUSE_INIT_EXT | FUSE_OVER_IO_URING;
 	int err;
-
-	if (fuse_uring_enabled())
-		flags |= FUSE_OVER_IO_URING;
 
 	memset(&inarg_in, 0, sizeof(inarg_in));
 	inarg_in.major = FUSE_KERNEL_VERSION;
@@ -1686,8 +1683,8 @@ static int fusex_send_init(struct fuse_mount *fm, struct fusex_id *id,
 	if (err)
 		return err;
 
-	if (flags & FUSE_OVER_IO_URING && fuse_uring_enabled())
-		fuse_chan_io_uring_enable(fm->fc->chan);
+	if (!(flags & FUSE_OVER_IO_URING))
+		return -EPROTONOSUPPORT;
 
 	return 0;
 }
@@ -1839,6 +1836,10 @@ static int fusex_parse_param(struct fs_context *fsc, struct fs_parameter *param)
 
 		/* Install channel now so the daemon can pre-register io_uring
 		 * entries before CMD_CREATE; conn is bound in fusex_get_tree().
+		 * fusex always runs over io_uring, so flip the channel's bit
+		 * up front: this bypasses the `enable_uring` module-param gate
+		 * in the REGISTER cmd path so daemons don't have to twiddle a
+		 * sysfs knob just to mount.
 		 */
 		fch = fuse_dev_chan_new();
 		if (!fch) {
@@ -1846,6 +1847,7 @@ static int fusex_parse_param(struct fs_context *fsc, struct fs_parameter *param)
 			return -ENOMEM;
 		}
 		fuse_dev_install(fud, fch);
+		fuse_chan_io_uring_enable(fch);
 		fsc->fs_private = fud;
 		break;
 	}
