@@ -19,6 +19,8 @@
 #include <uapi/linux/magic.h>
 
 static void fusex_init_inode(struct inode *inode);
+static int fusex_file_open(struct inode *inode, struct file *file);
+static int fusex_file_release(struct inode *inode, struct file *file);
 
 #define ADD_IN_ARG(_args, _size, _value) \
 	(*NEXT_IN_ARG(&(_args)) = (struct fuse_in_arg) { .size = (_size), .value = (_value) })
@@ -73,6 +75,18 @@ static ssize_t fusex_inode_request(struct inode *inode, struct fuse_args *args)
 	args->nodeid = get_node_id(inode);
 	/* will add file handle */
 	return fuse_simple_request(get_fuse_mount(inode), args);
+}
+
+/*
+ * Pull the daemon-minted fh out of a struct file's fuse_file slot.
+ * Returns 0 for inode-only paths (no file context, e.g. writeback
+ * writes, ATTR_FILE-less setattr) which the daemon must accept.
+ */
+static inline u64 fusex_file_fh(struct file *file)
+{
+	struct fuse_file *ff = file ? file->private_data : NULL;
+
+	return ff ? ff->fh : 0;
 }
 
 static ssize_t fusex_inode2_request(struct inode *inode, struct inode *inode2,
@@ -362,6 +376,7 @@ static long fusex_file_fallocate(struct file *file, int mode, loff_t offset, lof
 	struct inode *inode = file_inode(file);
 	FUSE_ARGS(args);
 	struct fuse_fallocate_in inarg = {
+		.fh     = fusex_file_fh(file),
 		.offset = offset,
 		.length = length,
 		.mode = mode
@@ -420,6 +435,8 @@ static const struct file_operations fusex_file_operations = {
 	.mmap_prepare	= generic_file_mmap_prepare,
 	.fsync		= simple_fsync_noflush,
 	.fallocate	= fusex_file_fallocate,
+	.open		= fusex_file_open,
+	.release	= fusex_file_release,
 };
 
 static int fusex_send_read(struct inode *inode, loff_t pos, struct file *file,
@@ -431,9 +448,10 @@ static int fusex_send_read(struct inode *inode, loff_t pos, struct file *file,
 	ssize_t res;
 
 	memset(&inarg, 0, sizeof(inarg));
+	inarg.fh = fusex_file_fh(file);
 	inarg.offset = pos;
 	inarg.size = len;
-	inarg.flags = file->f_flags;
+	inarg.flags = file ? file->f_flags : 0;
 	ap.args.opcode = FUSE_READ;
 	ADD_IN_ARG_S(ap.args, &inarg);
 	ADD_OUT_ARG(ap.args, len, NULL);
@@ -485,7 +503,7 @@ static int fusex_read_folio(struct file *file, struct folio *folio)
 	return err;
 }
 
-static int fusex_send_write(struct inode *inode, loff_t pos,
+static int fusex_send_write(struct inode *inode, loff_t pos, struct file *file,
 			     struct folio *folio, unsigned int off, unsigned int len)
 {
 	struct fuse_args_pages ap = {};
@@ -495,6 +513,7 @@ static int fusex_send_write(struct inode *inode, loff_t pos,
 	int err;
 
 	memset(&inarg, 0, sizeof(inarg));
+	inarg.fh = fusex_file_fh(file);
 	inarg.offset = pos;
 	inarg.size = len;
 
@@ -532,7 +551,9 @@ static int fusex_writepages(struct address_space *mapping, struct writeback_cont
 			if (i_size < folio_start + full_len)
 				len = i_size - folio_start;
 
-			err = fusex_send_write(inode, folio_start, folio, 0, len);
+			/* Writeback has no file context; daemon must accept fh=0. */
+			err = fusex_send_write(inode, folio_start, NULL,
+					       folio, 0, len);
 		}
 		folio_unlock(folio);
 	}
@@ -629,7 +650,8 @@ static ssize_t fusex_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 		kvfree(pages);
 
 		if (iov_iter_rw(iter) == WRITE) {
-			err = fusex_send_write(inode, pos, folio, off, len);
+			err = fusex_send_write(inode, pos, iocb->ki_filp,
+					       folio, off, len);
 		} else {
 			if (pos + len > old_size)
 				len = old_size - pos;
@@ -1278,6 +1300,8 @@ static int fusex_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct 
 		iattr->ia_valid |= ATTR_MTIME | ATTR_CTIME;
 
 	memset(&inarg, 0, sizeof(inarg));
+	if (iattr->ia_valid & ATTR_FILE)
+		inarg.fh = fusex_file_fh(iattr->ia_file);
 	if (iattr->ia_valid & ATTR_SIZE) {
 		inarg.stat.mask |= STATX_SIZE;
 		inarg.stat.size = iattr->ia_size;
@@ -1481,12 +1505,45 @@ static int fusex_dir_open(struct inode *inode, struct file *file)
 	return 0;
 }
 
+struct fusex_iput_work {
+	struct work_struct	work;
+	struct inode		*inode;
+};
+
+static struct workqueue_struct *fusex_iput_wq;
+
+static void fusex_iput_worker(struct work_struct *w)
+{
+	struct fusex_iput_work *iw = container_of(w, struct fusex_iput_work,
+						  work);
+
+	iput(iw->inode);
+	kfree(iw);
+}
+
 static void fusex_release_end(struct fuse_args *args, int error)
 {
 	struct fuse_release_args *ra = container_of(args, typeof(*ra), args);
 	struct fuse_file *ff = (struct fuse_file *) ra - 1;
+	struct fusex_iput_work *iw;
 
-	iput(ra->inode);
+	/*
+	 * Reached from fuse_uring_cmd's COMMIT_AND_FETCH path while the
+	 * daemon is sitting in io_uring_enter. iput() may evict and block
+	 * on inode_wait_for_writeback(); writeback needs the daemon to
+	 * service FUSE_WRITE on the same task -> self-deadlock. Push the
+	 * iput to a kworker so the daemon's submit task returns promptly.
+	 * fusex_kill_sb_anon() drains fusex_iput_wq before kill_anon_super()
+	 * to keep the deferred iput from racing the superblock teardown.
+	 */
+	iw = kmalloc(sizeof(*iw), GFP_NOFS);
+	if (likely(iw)) {
+		iw->inode = ra->inode;
+		INIT_WORK(&iw->work, fusex_iput_worker);
+		queue_work(fusex_iput_wq, &iw->work);
+	} else {
+		iput(ra->inode);
+	}
 	kfree(ff);
 }
 
@@ -1499,6 +1556,74 @@ static int fusex_dir_release(struct inode *inode, struct file *file)
 	ra->inarg.fh = ff->fh;
 
 	ra->args.opcode = FUSE_RELEASEDIR;
+	ra->args.force = true;
+	ra->args.nocreds = true;
+	ra->args.end = fusex_release_end;
+	ra->inode = igrab(inode);
+
+	if (fuse_simple_background(fm, &ra->args, GFP_KERNEL | __GFP_NOFAIL))
+		fusex_release_end(&ra->args, -ENOTCONN);
+
+	return 0;
+}
+
+static int fusex_send_open(struct fuse_file *ff, struct inode *inode,
+			   unsigned int flags)
+{
+	struct fuse_open_in inarg;
+	struct fuse_open_out outarg;
+	FUSE_ARGS(args);
+	int err;
+
+	memset(&inarg, 0, sizeof(inarg));
+	/* O_NOCTTY is tty-only and meaningless to a userspace daemon;
+	 * matches what mainline FUSE strips before forwarding.
+	 */
+	inarg.flags = flags & ~O_NOCTTY;
+
+	args.opcode = FUSE_OPEN;
+	ADD_IN_ARG_S(args, &inarg);
+	ADD_OUT_ARG_S(args, &outarg);
+
+	err = fusex_inode_request(inode, &args);
+	if (!err) {
+		ff->fh = outarg.fh;
+		ff->open_flags = outarg.open_flags;
+		ff->nodeid = get_node_id(inode);
+	}
+	return err;
+}
+
+static int fusex_file_open(struct inode *inode, struct file *file)
+{
+	struct fuse_file *ff __free(kfree) = fusex_file_alloc();
+	struct fuse_release_args *ra;
+	int err;
+
+	if (!ff)
+		return -ENOMEM;
+
+	ra = &ff->args->release_args;
+	ADD_IN_ARG_S(ra->args, &ra->inarg);
+
+	err = fusex_send_open(ff, inode, file->f_flags);
+	if (err)
+		return err;
+
+	file->private_data = no_free_ptr(ff);
+	return 0;
+}
+
+static int fusex_file_release(struct inode *inode, struct file *file)
+{
+	struct fuse_mount *fm = get_fuse_mount(inode);
+	struct fuse_file *ff = file->private_data;
+	struct fuse_release_args *ra = &ff->args->release_args;
+
+	ra->inarg.fh = ff->fh;
+	ra->inarg.flags = file->f_flags;
+
+	ra->args.opcode = FUSE_RELEASE;
 	ra->args.force = true;
 	ra->args.nocreds = true;
 	ra->args.end = fusex_release_end;
@@ -1896,6 +2021,12 @@ static void fusex_kill_sb_anon(struct super_block *sb)
 		if (fuse_mount_remove(fm))
 			fuse_conn_destroy(fm);
 	}
+	/*
+	 * fusex_release_end() defers iput() to fusex_iput_wq. Drain it
+	 * here so any in-flight iput finishes (and releases its inode
+	 * reference) before kill_anon_super() tears the superblock down.
+	 */
+	flush_workqueue(fusex_iput_wq);
 	kill_anon_super(sb);
 	fuse_mount_destroy(fm);
 }
@@ -1910,10 +2041,22 @@ static struct file_system_type fusex_fs_type = {
 
 int __init fusex_init(void)
 {
-	return register_filesystem(&fusex_fs_type);
+	int err;
+
+	fusex_iput_wq = alloc_workqueue("fusex_iput", WQ_UNBOUND, 0);
+	if (!fusex_iput_wq)
+		return -ENOMEM;
+
+	err = register_filesystem(&fusex_fs_type);
+	if (err) {
+		destroy_workqueue(fusex_iput_wq);
+		fusex_iput_wq = NULL;
+	}
+	return err;
 }
 
 void __exit fusex_cleanup(void)
 {
 	unregister_filesystem(&fusex_fs_type);
+	destroy_workqueue(fusex_iput_wq);
 }
