@@ -302,10 +302,17 @@ static struct inode *fusex_iget(struct super_block *sb, struct fusex_id *id)
 	return iget5_locked(sb, fusex_hash_id(id), fusex_inode_eq, fusex_inode_set, id);
 }
 
-static struct inode *fusex_get_inode(struct super_block *sb, struct fusex_id *id)
+/*
+ * @prefetched: optional attributes already returned by a compound
+ * (e.g. LOOKUPX+STATX). If non-NULL the caller has already validated
+ * them; we skip the per-inode STATX round-trip.
+ */
+static struct inode *fusex_get_inode(struct super_block *sb, struct fusex_id *id,
+				     struct fuse_statx *prefetched)
 {
 	struct inode *inode = fusex_iget(sb, id);
 	struct fuse_statx_out statx;
+	struct fuse_statx *attr;
 	int err;
 
 	if (!inode)
@@ -314,12 +321,17 @@ static struct inode *fusex_get_inode(struct super_block *sb, struct fusex_id *id
 	if (inode_state_read_once(inode) & I_NEW) {
 		/* I_NEW gives us exclusive ownership; i_lock not needed. */
 		inode_state_set_raw(inode, I_DONTCACHE);
-		err = fusex_send_statx(inode, &statx);
-		if (err) {
-			discard_new_inode(inode);
-			return ERR_PTR(err);
+		if (prefetched) {
+			attr = prefetched;
+		} else {
+			err = fusex_send_statx(inode, &statx);
+			if (err) {
+				discard_new_inode(inode);
+				return ERR_PTR(err);
+			}
+			attr = &statx.stat;
 		}
-		fusex_set_attr(inode, &statx.stat);
+		fusex_set_attr(inode, attr);
 		fusex_init_inode(inode);
 		unlock_new_inode(inode);
 	}
@@ -656,33 +668,64 @@ static void fusex_update_ctime(struct inode *inode)
 	__mark_inode_dirty(inode, I_DIRTY_SYNC);
 }
 
+/*
+ * LOOKUPX + STATX in one round-trip. The STATX subop depends on
+ * LOOKUPX's nodeid (filled in by the compound dispatcher's
+ * fuse_compound_propagate_nodeid); for a negative lookup the STATX
+ * fires against nodeid 0 and errors out — we ignore that error since
+ * the caller checks the NEGATIVE flag and discards the attrs.
+ */
 static struct inode *fusex_do_lookup(struct inode *base, const struct qstr *name)
 {
-	FUSE_ARGS(args);
-	struct fuse_entryx_out outarg;
+	FUSE_ARGS(args_lr);
+	FUSE_ARGS(args_sx);
+	struct fuse_entryx_out outarg_lr;
+	struct fuse_statx_out outarg_sx;
+	struct fuse_statx_in inarg_sx;
+	struct fuse_compound_arg ops[2];
 	struct fusex_id id;
-	int err;
+	int err_lr = 0, err_sx = 0;
+	ssize_t ret;
 
-	args.opcode = FUSE_LOOKUPX;
-	ADD_IN_ARG_ZERO(args);
-	ADD_IN_ARG(args, name->len + 1, name->name);
-	ADD_OUT_ARG_S(args, &outarg);
+	args_lr.opcode = FUSE_LOOKUPX;
+	args_lr.nodeid = get_node_id(base);
+	ADD_IN_ARG_ZERO(args_lr);
+	ADD_IN_ARG(args_lr, name->len + 1, name->name);
+	ADD_OUT_ARG_S(args_lr, &outarg_lr);
 
-	err = fusex_inode_request(base, &args);
-	if (err < 0)
-		return ERR_PTR(err);
+	fusex_fill_statx(&args_sx, &inarg_sx, &outarg_sx);
 
-	if (outarg.flags & FUSE_ENTRYX_NEGATIVE) {
-		if (err > 0)
-			return ERR_PTR(-EIO);
+	ops[0] = (struct fuse_compound_arg){
+		.arg = &args_lr,
+		.error = &err_lr,
+		.dep_index = FUSE_COMPOUND_NO_DEP,
+	};
+	ops[1] = (struct fuse_compound_arg){
+		.arg = &args_sx,
+		.error = &err_sx,
+		.dep_index = 0,
+	};
+
+	ret = fuse_compound_send(get_fuse_mount(base), ops, 2);
+	if (ret < 0)
+		return ERR_PTR(ret);
+	if (err_lr < 0)
+		return ERR_PTR(err_lr);
+
+	if (outarg_lr.flags & FUSE_ENTRYX_NEGATIVE)
 		return NULL;
-	}
 
-	err = fusex_id_from_args(&args, &id);
-	if (err)
-		return ERR_PTR(err);
+	if (err_sx < 0)
+		return ERR_PTR(err_sx);
+	if (!fuse_valid_type(outarg_sx.stat.mode) ||
+	    !fuse_valid_size(outarg_sx.stat.size))
+		return ERR_PTR(-EIO);
 
-	return fusex_get_inode(base->i_sb, &id);
+	err_lr = fusex_id_from_args(&args_lr, &id);
+	if (err_lr)
+		return ERR_PTR(err_lr);
+
+	return fusex_get_inode(base->i_sb, &id, &outarg_sx.stat);
 }
 
 
