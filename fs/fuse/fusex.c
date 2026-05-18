@@ -687,15 +687,6 @@ static int fusex_send_writes(struct inode *inode, loff_t pos, u64 fh,
 	return 0;
 }
 
-static int fusex_send_write(struct inode *inode, loff_t pos, struct file *file,
-			     struct folio *folio, unsigned int off, unsigned int len)
-{
-	struct fuse_folio_desc desc = { .offset = off, .length = len };
-
-	return fusex_send_writes(inode, pos, fusex_file_fh(file),
-				 &folio, &desc, 1, len);
-}
-
 /*
  * Pick any writable opener's fh so writeback can use the daemon's
  * cached backing fd instead of re-resolving via /proc/self/fd on every
@@ -859,49 +850,120 @@ out:
 static ssize_t fusex_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
+	struct file *file = iocb->ki_filp;
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	const bool is_write = (iov_iter_rw(iter) == WRITE);
+	const bool will_pin = iov_iter_extract_will_pin(iter);
+	const bool user_backed = user_backed_iter(iter);
+	const u64 fh = fusex_file_fh(file);
+	const unsigned int rflags = file->f_flags;
+	const unsigned int max_pages = min_t(unsigned int, fc->max_pages, 256);
+	const size_t max_size = is_write ? fc->max_write
+					 : (size_t)max_pages * PAGE_SIZE;
 	loff_t old_size = i_size_read(inode);
 	loff_t pos = iocb->ki_pos;
+	struct folio **folios __free(kfree) =
+		kmalloc_array(max_pages, sizeof(*folios), GFP_KERNEL);
+	struct fuse_folio_desc *descs __free(kfree) =
+		kmalloc_array(max_pages, sizeof(*descs), GFP_KERNEL);
 	int err = 0;
 
-	if (!iov_iter_count(iter) || (iov_iter_rw(iter) == READ && pos >= old_size))
+	if (!iov_iter_count(iter) || (!is_write && pos >= old_size))
 		return 0;
+	if (!folios || !descs)
+		return -ENOMEM;
 
-	for (;;) {
+	while (iov_iter_count(iter)) {
 		struct page **pages = NULL;
-		struct folio *folio;
-		ssize_t len;
-		size_t off;
+		size_t off, batch_len;
+		ssize_t got;
+		unsigned long npages;
+		unsigned int n;
 
-		len = iov_iter_extract_pages(iter, &pages, PAGE_SIZE, 1, 0, &off);
-		if (len <= 0) {
-			err = len;
+		got = iov_iter_extract_pages(iter, &pages, max_size,
+					     max_pages, 0, &off);
+		if (got <= 0) {
+			err = got;
 			break;
 		}
+		batch_len = got;
+		if (!is_write && pos + (loff_t)batch_len > old_size)
+			batch_len = old_size - pos;
 
-		folio = page_folio(pages[0]);
-		off += folio_page_idx(folio, pages[0]) * PAGE_SIZE;
+		/*
+		 * Pack the extracted pages into folios[]/descs[], merging
+		 * runs that fall in the same folio at adjacent offsets so
+		 * huge folios collapse to a single descriptor instead of one
+		 * per 4 KiB page.
+		 */
+		n = 0;
+		npages = 0;
+		{
+			size_t remaining = batch_len;
+			size_t cur_off = off;
+
+			while (remaining) {
+				struct folio *f = page_folio(pages[npages]);
+				size_t plen = min((size_t)(PAGE_SIZE - cur_off),
+						  remaining);
+				size_t fold_off =
+					(size_t)folio_page_idx(f, pages[npages]) *
+					PAGE_SIZE + cur_off;
+
+				if (n > 0 && folios[n - 1] == f &&
+				    descs[n - 1].offset + descs[n - 1].length ==
+				    fold_off) {
+					descs[n - 1].length += plen;
+				} else {
+					folios[n] = f;
+					descs[n].offset = fold_off;
+					descs[n].length = plen;
+					n++;
+				}
+				remaining -= plen;
+				cur_off = 0;
+				npages++;
+			}
+			/* Account for tail pages beyond batch_len (capped read). */
+			while (npages * PAGE_SIZE < (size_t)(got + off))
+				npages++;
+		}
+
+		if (is_write) {
+			int werr = fusex_send_writes(inode, pos, fh, folios,
+						     descs, n, batch_len);
+			if (werr)
+				err = werr;
+		} else {
+			ssize_t got_back = fusex_send_reads(inode, pos, fh,
+							    rflags, folios,
+							    descs, n, batch_len);
+			if (got_back < 0) {
+				err = got_back;
+			} else {
+				if ((size_t)got_back < batch_len)
+					batch_len = got_back;
+				if (user_backed) {
+					unsigned int i;
+					for (i = 0; i < n; i++)
+						folio_mark_dirty_lock(folios[i]);
+				}
+			}
+		}
+
+		if (will_pin)
+			unpin_user_pages(pages, npages);
 		kvfree(pages);
 
-		if (iov_iter_rw(iter) == WRITE) {
-			err = fusex_send_write(inode, pos, iocb->ki_filp,
-					       folio, off, len);
-		} else {
-			if (pos + len > old_size)
-				len = old_size - pos;
-
-			err = fusex_send_read(inode, pos, iocb->ki_filp, folio, off, len);
-			if (!err && user_backed_iter(iter))
-				folio_mark_dirty_lock(folio);
-		}
-		if (iov_iter_extract_will_pin(iter))
-			unpin_folio(folio);
-
-		if (err || !len)
+		if (err)
 			break;
-		pos += len;
+		pos += batch_len;
+		if (!is_write && (size_t)got > batch_len)
+			break;  /* hit EOF mid-batch */
 	}
+
 	if (pos > iocb->ki_pos) {
-		if (iov_iter_rw(iter) == WRITE) {
+		if (is_write) {
 			if (pos > old_size)
 				i_size_write(inode, pos);
 			fusex_extend_file(inode, old_size, iocb->ki_pos);
