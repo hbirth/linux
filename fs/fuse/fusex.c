@@ -134,6 +134,7 @@ static struct inode *fusex_alloc_inode(struct super_block *sb)
 	/* Initialize private data (i.e. everything except fi->inode) */
 	BUILD_BUG_ON(offsetof(struct fuse_inode, inode) != 0);
 	memset((void *) fi + sizeof(fi->inode), 0, sizeof(*fi) - sizeof(fi->inode));
+	spin_lock_init(&fi->lock);
 
 	fi->forget = no_free_ptr(forget);
 	return &fi->inode;
@@ -532,59 +533,147 @@ static int fusex_read_folio(struct file *file, struct folio *folio)
 	return err;
 }
 
-static int fusex_send_write(struct inode *inode, loff_t pos, struct file *file,
-			     struct folio *folio, unsigned int off, unsigned int len)
+/*
+ * Dispatch a FUSE_WRITE for one or more contiguous folios starting at
+ * @pos, totalling @total_len bytes. Callers populate @folios[]/@descs[]
+ * with the per-folio (offset, length) split.
+ */
+static int fusex_send_writes(struct inode *inode, loff_t pos, u64 fh,
+			     struct folio **folios,
+			     struct fuse_folio_desc *descs,
+			     unsigned int nfolios, size_t total_len)
 {
 	struct fuse_args_pages ap = {};
-	struct fuse_folio_desc desc = { .offset = off, .length = len };
 	struct fuse_write_in inarg;
 	struct fuse_write_out outarg;
 	int err;
 
 	memset(&inarg, 0, sizeof(inarg));
-	inarg.fh = fusex_file_fh(file);
+	inarg.fh = fh;
 	inarg.offset = pos;
-	inarg.size = len;
+	inarg.size = total_len;
 
 	ap.args.opcode = FUSE_WRITE;
 	ADD_IN_ARG_S(ap.args, &inarg);
-	ADD_IN_ARG(ap.args, len, NULL);
+	ADD_IN_ARG(ap.args, total_len, NULL);
 	ap.args.in_pages = true;
-	ap.num_folios = 1;
-	ap.folios = &folio;
-	ap.descs = &desc;
+	ap.num_folios = nfolios;
+	ap.folios = folios;
+	ap.descs = descs;
 	ADD_OUT_ARG_S(ap.args, &outarg);
 
 	err = fusex_inode_request(inode, &ap.args);
 	if (err)
 		return err;
 
-	if (outarg.size != len)
+	if (outarg.size != total_len)
 		return -EIO;
 
 	return 0;
 }
 
-static int fusex_writepages(struct address_space *mapping, struct writeback_control *wbc)
+static int fusex_send_write(struct inode *inode, loff_t pos, struct file *file,
+			     struct folio *folio, unsigned int off, unsigned int len)
 {
+	struct fuse_folio_desc desc = { .offset = off, .length = len };
+
+	return fusex_send_writes(inode, pos, fusex_file_fh(file),
+				 &folio, &desc, 1, len);
+}
+
+/*
+ * Pick any writable opener's fh so writeback can use the daemon's
+ * cached backing fd instead of re-resolving via /proc/self/fd on every
+ * batch. Returns 0 if no writer is currently open (msync after close,
+ * shrinker-triggered writeback, ...); daemons must tolerate that.
+ */
+static u64 fusex_writeback_fh(struct fuse_inode *fi)
+{
+	u64 fh = 0;
+
+	spin_lock(&fi->lock);
+	if (!list_empty(&fi->write_files)) {
+		struct fuse_file *ff = list_first_entry(&fi->write_files,
+							struct fuse_file,
+							write_entry);
+		fh = ff->fh;
+	}
+	spin_unlock(&fi->lock);
+	return fh;
+}
+
+static int fusex_writepages(struct address_space *mapping,
+			    struct writeback_control *wbc)
+{
+	struct inode *inode = mapping->host;
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	const unsigned int max_folios = min_t(unsigned int, fc->max_pages, 256);
+	const size_t max_size = fc->max_write;
+	const u64 fh = fusex_writeback_fh(fi);
+	struct folio **folios __free(kfree) =
+		kmalloc_array(max_folios, sizeof(*folios), GFP_KERNEL);
+	struct fuse_folio_desc *descs __free(kfree) =
+		kmalloc_array(max_folios, sizeof(*descs), GFP_KERNEL);
 	struct folio *folio = NULL;
-	int err;
+	unsigned int n = 0;
+	loff_t batch_pos = 0;
+	size_t batch_len = 0;
+	int err = 0;
+
+	if (!folios || !descs)
+		return -ENOMEM;
 
 	while ((folio = writeback_iter(mapping, wbc, folio, &err))) {
-		struct inode *inode = folio->mapping->host;
 		loff_t folio_start = folio_pos(folio);
 		loff_t i_size = i_size_read(inode);
 		size_t full_len = folio_size(folio), len = full_len;
 
-		if (folio_start < i_size) {
-			if (i_size < folio_start + full_len)
-				len = i_size - folio_start;
-
-			/* Writeback has no file context; daemon must accept fh=0. */
-			err = fusex_send_write(inode, folio_start, NULL,
-					       folio, 0, len);
+		if (folio_start >= i_size) {
+			folio_unlock(folio);
+			continue;
 		}
-		folio_unlock(folio);
+		if (i_size < folio_start + full_len)
+			len = i_size - folio_start;
+
+		/* Break the batch when the new folio isn't contiguous, the
+		 * folio-count cap is reached, or max_write would be exceeded. */
+		if (n &&
+		    (folio_start != batch_pos + (loff_t)batch_len ||
+		     n >= max_folios ||
+		     batch_len + len > max_size)) {
+			unsigned int i;
+			int ferr = fusex_send_writes(inode, batch_pos, fh,
+						     folios, descs, n,
+						     batch_len);
+			for (i = 0; i < n; i++)
+				folio_unlock(folios[i]);
+			n = 0;
+			batch_len = 0;
+			if (ferr) {
+				err = ferr;
+				folio_unlock(folio);
+				break;
+			}
+		}
+
+		if (!n)
+			batch_pos = folio_start;
+		folios[n] = folio;
+		descs[n].offset = 0;
+		descs[n].length = len;
+		batch_len += len;
+		n++;
+	}
+
+	if (n) {
+		unsigned int i;
+		int ferr = fusex_send_writes(inode, batch_pos, fh,
+					     folios, descs, n, batch_len);
+		for (i = 0; i < n; i++)
+			folio_unlock(folios[i]);
+		if (!err)
+			err = ferr;
 	}
 
 	return err;
@@ -1658,6 +1747,7 @@ static int fusex_send_open(struct fuse_file *ff, struct inode *inode,
 
 static int fusex_file_open(struct inode *inode, struct file *file)
 {
+	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_file *ff __free(kfree) = fusex_file_alloc();
 	struct fuse_release_args *ra;
 	int err;
@@ -1672,6 +1762,16 @@ static int fusex_file_open(struct inode *inode, struct file *file)
 	if (err)
 		return err;
 
+	/*
+	 * Writeback runs without a struct file, so fusex_writepages picks
+	 * an fh off this list. Any writable opener is fair game.
+	 */
+	if (file->f_mode & FMODE_WRITE) {
+		spin_lock(&fi->lock);
+		list_add_tail(&ff->write_entry, &fi->write_files);
+		spin_unlock(&fi->lock);
+	}
+
 	file->private_data = no_free_ptr(ff);
 	return 0;
 }
@@ -1679,8 +1779,15 @@ static int fusex_file_open(struct inode *inode, struct file *file)
 static int fusex_file_release(struct inode *inode, struct file *file)
 {
 	struct fuse_mount *fm = get_fuse_mount(inode);
+	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_file *ff = file->private_data;
 	struct fuse_release_args *ra = &ff->args->release_args;
+
+	if (file->f_mode & FMODE_WRITE) {
+		spin_lock(&fi->lock);
+		list_del(&ff->write_entry);
+		spin_unlock(&fi->lock);
+	}
 
 	ra->inarg.fh = ff->fh;
 	ra->inarg.flags = file->f_flags;
@@ -1741,6 +1848,7 @@ static void fusex_init_inode(struct inode *inode)
 
 	switch (inode->i_mode & S_IFMT) {
 	case S_IFREG:
+		INIT_LIST_HEAD(&fi->write_files);
 		inode->i_op = &fusex_file_inode_operations;
 		{
 			struct fuse_conn *fc = get_fuse_conn(inode);
