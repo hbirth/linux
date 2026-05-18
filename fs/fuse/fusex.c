@@ -74,14 +74,6 @@ static ssize_t fusex_inode_request(struct inode *inode, struct fuse_args *args)
 	return fuse_simple_request(get_fuse_mount(inode), args);
 }
 
-static ssize_t fusex_id_request(struct inode *inode, const struct fusex_id *id,
-				struct fuse_args *args)
-{
-	args->nodeid = id->nodeid;
-	/* will add file handle */
-	return fuse_simple_request(get_fuse_mount(inode), args);
-}
-
 static ssize_t fusex_inode2_request(struct inode *inode, struct inode *inode2,
 				    struct fuse_args *args)
 {
@@ -954,103 +946,144 @@ static int fusex_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
 	return err;
 }
 
-static int fusex_send_mkobjx(struct inode *dir, struct inode *inode,
-			     const struct qstr *name, const char *link_body, struct fusex_id *id)
+/*
+ * Compound dispatch for object creation. We always have MKOBJX and the
+ * post-create STATX; if the parent dir contributed ACLs we also have one
+ * or two SETXATTR subops. The STATX and the SETXATTRs all carry
+ * dep_index = MKOBJX so the dispatcher (or the legacy fallback) fills in
+ * the freshly minted nodeid before they run.
+ */
+static int fusex_do_mkobjx(struct inode *dir, struct inode *inode, const struct qstr *name,
+			   const char *link_body, struct fuse_statx_out *outarg_sx)
 {
-	FUSE_ARGS(args);
-	struct fuse_mkobjx_in inarg;
-	struct fuse_entryx_out outarg;
+	FUSE_ARGS(args_mk);
+	FUSE_ARGS(args_xa_access);
+	FUSE_ARGS(args_xa_default);
+	FUSE_ARGS(args_sx);
+	/* inarg_mk embeds a fuse_statx; together with the four FUSE_ARGS
+	 * blocks on the stack the frame would exceed 1024 B, so heap it.
+	 */
+	struct fuse_mkobjx_in *inarg_mk __free(kfree) =
+		kzalloc(sizeof(*inarg_mk), GFP_KERNEL);
+	struct fuse_entryx_out outarg_mk;
+	struct fuse_setxattr_in inarg_xa_access, inarg_xa_default;
+	struct fuse_statx_in inarg_sx;
+	void *acl_access __free(kfree) = NULL;
+	void *acl_default __free(kfree) = NULL;
+	size_t acl_access_size = 0, acl_default_size = 0;
+	struct fuse_compound_arg ops[4];
+	int err[4] = { 0 };
+	unsigned int count = 0;
+	const unsigned int mkobjx_idx = 0;
 	struct user_namespace *u = i_user_ns(inode);
-	int flags = 0;
-	int err;
+	struct fusex_id id;
+	struct inode *old;
+	int mk_flags = 0;
+	ssize_t ret;
+	int rc;
+	unsigned int i;
 
-	if (!name->len) {
-		WARN_ON((inode->i_mode & S_IFMT) != S_IFREG);
-		flags |= FUSE_MKOBJX_TMPFILE;
-	}
-
-	memset(&inarg, 0, sizeof(inarg));
-	inarg.namesize = name->len + 1;
-	inarg.stat.mask = STATX_UID | STATX_GID | STATX_MODE | STATX_TYPE | STATX_BTIME;
-	inarg.stat.uid = from_kuid(u, inode->i_uid);
-	inarg.stat.gid = from_kgid(u, inode->i_gid);
-	inarg.stat.rdev_major = MAJOR(inode->i_rdev);
-	inarg.stat.rdev_minor = MINOR(inode->i_rdev);
-	inarg.stat.mode = inode->i_mode;
-	fusex_get_atime(inode, &inarg.stat);
-	fusex_get_mtime(inode, &inarg.stat);
-	fusex_get_ctime(inode, &inarg.stat);
-	inarg.stat.btime = inarg.stat.ctime;
-	inarg.flags = flags;
-
-	args.opcode = FUSE_MKOBJX;
-	/* Split header / stat so in_args[0] fits in io_uring's 128 B op_in */
-	ADD_IN_ARG(args, offsetof(struct fuse_mkobjx_in, stat), &inarg);
-	ADD_IN_ARG_S(args, &inarg.stat);
-	ADD_IN_ARG(args, inarg.namesize, name->name);
-	if (S_ISLNK(inode->i_mode))
-		ADD_IN_ARG(args, strlen(link_body) + 1, link_body);
-	ADD_OUT_ARG_S(args, &outarg);
-
-	err = fusex_inode_request(dir, &args);
-	if (err)
-		return err;
-
-	return fusex_id_from_args(&args, id);
-}
-
-static int fusex_set_initial_acl(struct inode *inode, const struct fusex_id *id, int type)
-{
-	struct posix_acl *acl = (type == ACL_TYPE_ACCESS) ? inode->i_acl : inode->i_default_acl;
-	if (!acl)
-		return 0;
-
-	FUSE_ARGS(args);
-	struct fuse_setxattr_in inarg;
-	size_t size;
-	const char *name = posix_acl_xattr_name(type);
-	const void *value __free(kfree) =
-		posix_acl_to_xattr(i_user_ns(inode), acl, &size, GFP_KERNEL);
-	if (!value)
+	if (!inarg_mk)
 		return -ENOMEM;
 
-	fusex_fill_setxattr(&args, &inarg, name, value, size, 0);
+	/* --- MKOBJX --- */
+	if (!name->len) {
+		WARN_ON((inode->i_mode & S_IFMT) != S_IFREG);
+		mk_flags |= FUSE_MKOBJX_TMPFILE;
+	}
+	inarg_mk->namesize = name->len + 1;
+	inarg_mk->stat.mask = STATX_UID | STATX_GID | STATX_MODE | STATX_TYPE | STATX_BTIME;
+	inarg_mk->stat.uid = from_kuid(u, inode->i_uid);
+	inarg_mk->stat.gid = from_kgid(u, inode->i_gid);
+	inarg_mk->stat.rdev_major = MAJOR(inode->i_rdev);
+	inarg_mk->stat.rdev_minor = MINOR(inode->i_rdev);
+	inarg_mk->stat.mode = inode->i_mode;
+	fusex_get_atime(inode, &inarg_mk->stat);
+	fusex_get_mtime(inode, &inarg_mk->stat);
+	fusex_get_ctime(inode, &inarg_mk->stat);
+	inarg_mk->stat.btime = inarg_mk->stat.ctime;
+	inarg_mk->flags = mk_flags;
 
-	return fusex_id_request(inode, id, &args);
-}
+	args_mk.opcode = FUSE_MKOBJX;
+	args_mk.nodeid = get_node_id(dir);
+	/* Split header / stat so in_args[0] fits in io_uring's 128 B op_in */
+	ADD_IN_ARG(args_mk, offsetof(struct fuse_mkobjx_in, stat), inarg_mk);
+	ADD_IN_ARG_S(args_mk, &inarg_mk->stat);
+	ADD_IN_ARG(args_mk, inarg_mk->namesize, name->name);
+	if (S_ISLNK(inode->i_mode))
+		ADD_IN_ARG(args_mk, strlen(link_body) + 1, link_body);
+	ADD_OUT_ARG_S(args_mk, &outarg_mk);
 
-static int fusex_do_mkobjx(struct inode *dir, struct inode *inode, const struct qstr *name,
-			     const char *link_body, struct fuse_statx_out *outarg_sx)
-{
-	FUSE_ARGS(args_sx);
-	struct fuse_statx_in inarg_sx;
-	struct inode *old;
-	struct fusex_id id;
-	int err;
+	ops[count++] = (struct fuse_compound_arg){
+		.arg = &args_mk,
+		.error = &err[mkobjx_idx],
+		.dep_index = FUSE_COMPOUND_NO_DEP,
+	};
 
-	err = fusex_send_mkobjx(dir, inode, name, link_body, &id);
-	if (err)
-		return err;
+	/* --- ACL setxattrs (optional) --- */
+	if (inode->i_acl) {
+		acl_access = posix_acl_to_xattr(u, inode->i_acl,
+						&acl_access_size, GFP_KERNEL);
+		if (!acl_access)
+			return -ENOMEM;
+		fusex_fill_setxattr(&args_xa_access, &inarg_xa_access,
+				    posix_acl_xattr_name(ACL_TYPE_ACCESS),
+				    acl_access, acl_access_size, 0);
+		ops[count] = (struct fuse_compound_arg){
+			.arg = &args_xa_access,
+			.error = &err[count],
+			.dep_index = mkobjx_idx,
+		};
+		count++;
+	}
+	if (inode->i_default_acl) {
+		acl_default = posix_acl_to_xattr(u, inode->i_default_acl,
+						 &acl_default_size, GFP_KERNEL);
+		if (!acl_default)
+			return -ENOMEM;
+		fusex_fill_setxattr(&args_xa_default, &inarg_xa_default,
+				    posix_acl_xattr_name(ACL_TYPE_DEFAULT),
+				    acl_default, acl_default_size, 0);
+		ops[count] = (struct fuse_compound_arg){
+			.arg = &args_xa_default,
+			.error = &err[count],
+			.dep_index = mkobjx_idx,
+		};
+		count++;
+	}
+
+	/* --- STATX --- */
+	fusex_fill_statx(&args_sx, &inarg_sx, outarg_sx);
+	ops[count] = (struct fuse_compound_arg){
+		.arg = &args_sx,
+		.error = &err[count],
+		.dep_index = mkobjx_idx,
+	};
+	count++;
+
+	ret = fuse_compound_send(get_fuse_mount(dir), ops, count);
+	if (ret < 0)
+		return ret;
+
+	if (err[mkobjx_idx])
+		return err[mkobjx_idx];
 
 	/*
-	 * The server has minted a nodeid for us. Record it on the inode
-	 * immediately so that any failure below leaves the eviction path
-	 * able to send FORGET and reclaim the server-side reference.
+	 * MKOBJX succeeded: the server minted a nodeid. Record it on the
+	 * inode now so that any failure below still leaves the eviction
+	 * path able to send FORGET and reclaim the server-side reference.
 	 */
+	rc = fusex_id_from_args(&args_mk, &id);
+	if (rc)
+		return rc;
 	get_fuse_inode(inode)->nodeid = id.nodeid;
 
-	err = fusex_set_initial_acl(inode, &id, ACL_TYPE_ACCESS);
-	if (err)
-		return err;
-
-	err = fusex_set_initial_acl(inode, &id, ACL_TYPE_DEFAULT);
-	if (err)
-		return err;
-
-	fusex_fill_statx(&args_sx, &inarg_sx, outarg_sx);
-	err = fusex_id_request(inode, &id, &args_sx);
-	if (err)
-		return err;
+	for (i = 0; i < count; i++) {
+		if (i == mkobjx_idx)
+			continue;
+		if (err[i])
+			return err[i];
+	}
 
 	old = inode_insert5(inode, fusex_hash_id(&id), fusex_inode_eq, fusex_inode_set, &id);
 	if (old != inode) {
