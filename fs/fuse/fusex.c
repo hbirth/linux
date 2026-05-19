@@ -32,23 +32,33 @@ static int fusex_file_release(struct inode *inode, struct file *file);
  * else stays generic — no run-time branching inside the read/write/
  * writepages callbacks.
  *
- *   WRITEBACK   page-cached reads and writes; writeback flushes dirty
- *               folios out via fusex_writepages. Mount default when
- *               the daemon negotiated FUSE_WRITEBACK_CACHE.
+ *   WRITEBACK     page-cached reads and writes; writeback flushes dirty
+ *                 folios out via fusex_writepages. Mount default when
+ *                 the daemon negotiated FUSE_WRITEBACK_CACHE.
  *
- *   DIRECT      neither reads nor writes touch the page cache; each
- *               iov_iter is shipped to the daemon as a multi-folio
- *               FUSE_READ/FUSE_WRITE batch. Selected per-file when the
- *               daemon returns FOPEN_DIRECT_IO or the open was O_DIRECT.
+ *   WRITETHROUGH  cached reads, synchronous writes. The aops only
+ *                 registers read-side callbacks; write_iter ships the
+ *                 iov_iter to the daemon as a multi-folio FUSE_WRITE and
+ *                 invalidates the affected page range so subsequent
+ *                 cached reads don't return stale data. Mount default
+ *                 when FUSE_WRITEBACK_CACHE is not negotiated.
+ *
+ *   DIRECT        neither reads nor writes touch the page cache; each
+ *                 iov_iter is shipped to the daemon as a multi-folio
+ *                 FUSE_READ/FUSE_WRITE batch. Selected per-file when the
+ *                 daemon returns FOPEN_DIRECT_IO or the open was O_DIRECT.
  */
 enum fusex_io_flavor {
 	FUSEX_IO_WRITEBACK,
+	FUSEX_IO_WRITETHROUGH,
 	FUSEX_IO_DIRECT,
 };
 
 static const struct file_operations fusex_fops_writeback;
+static const struct file_operations fusex_fops_writethrough;
 static const struct file_operations fusex_fops_direct;
 static const struct address_space_operations fusex_aops_writeback;
+static const struct address_space_operations fusex_aops_writethrough;
 static const struct address_space_operations fusex_aops_direct;
 
 #define ADD_IN_ARG(_args, _size, _value) \
@@ -1036,11 +1046,70 @@ static const struct address_space_operations fusex_aops_direct = {
 };
 
 /*
+ * Write-through flavor — cached reads, synchronous writes. The aops
+ * registers only the read side (read_folio + readahead) so reads benefit
+ * from page-cache and readahead. write_iter writes the user buffer
+ * straight to the daemon through fusex_direct_IO, then invalidates the
+ * affected page range so subsequent cached reads don't return stale
+ * data. No writepages / write_begin / write_end / dirty_folio: writes
+ * never enter the cache, so there is nothing for writeback to flush.
+ */
+static ssize_t
+fusex_write_iter_writethrough(struct kiocb *iocb, struct iov_iter *from)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+	loff_t pos;
+	ssize_t ret;
+
+	inode_lock(inode);
+	ret = generic_write_checks(iocb, from);
+	if (ret <= 0)
+		goto out_unlock;
+
+	pos = iocb->ki_pos;
+	ret = fusex_direct_IO(iocb, from);
+	if (ret > 0) {
+		pgoff_t start = pos >> PAGE_SHIFT;
+		pgoff_t end = (pos + ret - 1) >> PAGE_SHIFT;
+
+		invalidate_inode_pages2_range(inode->i_mapping, start, end);
+	}
+out_unlock:
+	inode_unlock(inode);
+	return ret;
+}
+
+static const struct file_operations fusex_fops_writethrough = {
+	.read_iter	= generic_file_read_iter,
+	.write_iter	= fusex_write_iter_writethrough,
+	.splice_read	= filemap_splice_read,
+	.llseek		= generic_file_llseek,
+	.mmap_prepare	= generic_file_mmap_prepare,
+	.fsync		= simple_fsync_noflush,
+	.fallocate	= fusex_file_fallocate,
+	.open		= fusex_file_open,
+	.release	= fusex_file_release,
+	/* No splice_write: would route through writepages which don't exist. */
+};
+
+static const struct address_space_operations fusex_aops_writethrough = {
+	.read_folio	= fusex_read_folio,
+	.readahead	= fusex_readahead,
+	/*
+	 * No writepages / write_begin / write_end / dirty_folio: write_iter
+	 * above bypasses the cache for writes, so nothing can become dirty
+	 * here.
+	 */
+};
+
+/*
  * Resolve the mount-default I/O flavor.
  */
 static enum fusex_io_flavor fusex_mount_io_flavor(const struct fuse_conn *fc)
 {
-	return FUSEX_IO_WRITEBACK;
+	if (fc->writeback_cache)
+		return FUSEX_IO_WRITEBACK;
+	return FUSEX_IO_WRITETHROUGH;
 }
 
 /*
@@ -1059,8 +1128,9 @@ static enum fusex_io_flavor fusex_file_io_flavor(const struct file *file,
 static const struct file_operations *fusex_fops_for(enum fusex_io_flavor f)
 {
 	switch (f) {
-	case FUSEX_IO_DIRECT:	 return &fusex_fops_direct;
-	case FUSEX_IO_WRITEBACK: return &fusex_fops_writeback;
+	case FUSEX_IO_DIRECT:	    return &fusex_fops_direct;
+	case FUSEX_IO_WRITETHROUGH: return &fusex_fops_writethrough;
+	case FUSEX_IO_WRITEBACK:    return &fusex_fops_writeback;
 	}
 	return &fusex_fops_writeback;
 }
@@ -1069,8 +1139,9 @@ static const struct address_space_operations *
 fusex_aops_for(enum fusex_io_flavor f)
 {
 	switch (f) {
-	case FUSEX_IO_DIRECT:	 return &fusex_aops_direct;
-	case FUSEX_IO_WRITEBACK: return &fusex_aops_writeback;
+	case FUSEX_IO_DIRECT:	    return &fusex_aops_direct;
+	case FUSEX_IO_WRITETHROUGH: return &fusex_aops_writethrough;
+	case FUSEX_IO_WRITEBACK:    return &fusex_aops_writeback;
 	}
 	return &fusex_aops_writeback;
 }
@@ -2207,6 +2278,13 @@ static int fusex_send_init(struct fuse_mount *fm, struct fusex_id *id,
 	fm->fc->max_write = outarg_in.max_write;
 	fm->fc->max_pages = min_t(unsigned int, fm->fc->max_pages_limit,
 				  max_t(unsigned int, outarg_in.max_pages, 1));
+	/*
+	 * The daemon echoes FUSE_WRITEBACK_CACHE only if it's willing to
+	 * cope with the kernel batching dirty pages; record the result so
+	 * fusex_mount_io_flavor() can pick writeback vs writethrough.
+	 */
+	if (flags & FUSE_WRITEBACK_CACHE)
+		fm->fc->writeback_cache = 1;
 
 	args_lr.opcode = FUSE_LOOKUP_ROOT;
 	ADD_OUT_ARG_S(args_lr, &outarg_lr);
