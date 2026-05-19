@@ -22,6 +22,29 @@ static void fusex_init_inode(struct inode *inode);
 static int fusex_file_open(struct inode *inode, struct file *file);
 static int fusex_file_release(struct inode *inode, struct file *file);
 
+/*
+ * fusex I/O flavors.
+ *
+ * A flavor is a self-contained pair of (file_operations, address_space_
+ * operations) that overrides only the callbacks that flavor needs.
+ * Selection happens once at inode setup based on the mount-default
+ * resolved from negotiated INIT flags. Everything else stays generic —
+ * no run-time branching inside the read/write/writepages callbacks.
+ *
+ *   WRITEBACK   page-cached reads and writes; writeback flushes dirty
+ *               folios out via fusex_writepages. Mount default when
+ *               the daemon negotiated FUSE_WRITEBACK_CACHE.
+ *
+ * Additional flavors (DIRECT, WRITETHROUGH, IOMAP) are added as
+ * separate self-contained commits on top.
+ */
+enum fusex_io_flavor {
+	FUSEX_IO_WRITEBACK,
+};
+
+static const struct file_operations fusex_fops_writeback;
+static const struct address_space_operations fusex_aops_writeback;
+
 #define ADD_IN_ARG(_args, _size, _value) \
 	(*NEXT_IN_ARG(&(_args)) = (struct fuse_in_arg) { .size = (_size), .value = (_value) })
 
@@ -426,7 +449,13 @@ static long fusex_file_fallocate(struct file *file, int mode, loff_t offset, lof
 	return 0;
 }
 
-static const struct file_operations fusex_file_operations = {
+/*
+ * Writeback flavor — page-cached read/write path. read_iter and write_iter
+ * go through the generic helpers, which exercise our aops below: reads via
+ * read_folio/readahead, writes via write_begin/write_end and (asynchronously)
+ * writepages. Splice and mmap are page-cache-based as well.
+ */
+static const struct file_operations fusex_fops_writeback = {
 	.read_iter	= generic_file_read_iter,
 	.write_iter	= generic_file_write_iter,
 	.splice_read	= filemap_splice_read,
@@ -678,7 +707,14 @@ static ssize_t fusex_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 	return (pos - iocb->ki_pos) ?: err;
 }
 
-static const struct address_space_operations fusex_file_aops  = {
+/*
+ * Writeback flavor — address space operations. read_folio/readahead serve
+ * the cache-population side; writepages + write_begin/write_end handle the
+ * dirty-out side. direct_IO stays here for the legacy generic_*_iter ->
+ * aops.direct_IO entry path, but new code reaches the same logic through
+ * the direct flavor's read_iter/write_iter below.
+ */
+static const struct address_space_operations fusex_aops_writeback = {
 	.read_folio	= fusex_read_folio,
 	.writepages	= fusex_writepages,
 	.write_begin	= fusex_write_begin,
@@ -687,6 +723,32 @@ static const struct address_space_operations fusex_file_aops  = {
 	.dirty_folio	= filemap_dirty_folio,
 	.migrate_folio	= filemap_migrate_folio,
 };
+
+/*
+ * Resolve the mount-default I/O flavor. Today there is only one;
+ * additional flavors will extend this switch as they land.
+ */
+static enum fusex_io_flavor fusex_mount_io_flavor(const struct fuse_conn *fc)
+{
+	return FUSEX_IO_WRITEBACK;
+}
+
+static const struct file_operations *fusex_fops_for(enum fusex_io_flavor f)
+{
+	switch (f) {
+	case FUSEX_IO_WRITEBACK: return &fusex_fops_writeback;
+	}
+	return &fusex_fops_writeback;
+}
+
+static const struct address_space_operations *
+fusex_aops_for(enum fusex_io_flavor f)
+{
+	switch (f) {
+	case FUSEX_IO_WRITEBACK: return &fusex_aops_writeback;
+	}
+	return &fusex_aops_writeback;
+}
 
 static void fusex_dir_modified(struct inode *dir)
 {
@@ -1680,8 +1742,13 @@ static void fusex_init_inode(struct inode *inode)
 	switch (inode->i_mode & S_IFMT) {
 	case S_IFREG:
 		inode->i_op = &fusex_file_inode_operations;
-		inode->i_fop = &fusex_file_operations;
-		inode->i_data.a_ops = &fusex_file_aops;
+		{
+			struct fuse_conn *fc = get_fuse_conn(inode);
+			enum fusex_io_flavor f = fusex_mount_io_flavor(fc);
+
+			inode->i_fop = fusex_fops_for(f);
+			inode->i_data.a_ops = fusex_aops_for(f);
+		}
 		mapping_set_writeback_may_deadlock_on_reclaim(&inode->i_data);
 		break;
 
@@ -1766,7 +1833,7 @@ static int fusex_send_init(struct fuse_mount *fm, struct fusex_id *id,
 	struct fuse_init_out outarg_in;
 	struct fuse_entryx_out outarg_lr;
 	struct fuse_statx_in inarg_sx;
-	u64 flags = FUSE_INIT_EXT | FUSE_OVER_IO_URING;
+	u64 flags = FUSE_INIT_EXT | FUSE_OVER_IO_URING | FUSE_WRITEBACK_CACHE;
 	int err;
 
 	memset(&inarg_in, 0, sizeof(inarg_in));
