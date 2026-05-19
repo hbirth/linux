@@ -27,23 +27,29 @@ static int fusex_file_release(struct inode *inode, struct file *file);
  *
  * A flavor is a self-contained pair of (file_operations, address_space_
  * operations) that overrides only the callbacks that flavor needs.
- * Selection happens once at inode setup based on the mount-default
- * resolved from negotiated INIT flags. Everything else stays generic —
- * no run-time branching inside the read/write/writepages callbacks.
+ * Selection happens at inode setup (per-mount default) and is optionally
+ * narrowed per-file at open() time (e.g. FOPEN_DIRECT_IO). Everything
+ * else stays generic — no run-time branching inside the read/write/
+ * writepages callbacks.
  *
  *   WRITEBACK   page-cached reads and writes; writeback flushes dirty
  *               folios out via fusex_writepages. Mount default when
  *               the daemon negotiated FUSE_WRITEBACK_CACHE.
  *
- * Additional flavors (DIRECT, WRITETHROUGH, IOMAP) are added as
- * separate self-contained commits on top.
+ *   DIRECT      neither reads nor writes touch the page cache; each
+ *               iov_iter is shipped to the daemon as a multi-folio
+ *               FUSE_READ/FUSE_WRITE batch. Selected per-file when the
+ *               daemon returns FOPEN_DIRECT_IO or the open was O_DIRECT.
  */
 enum fusex_io_flavor {
 	FUSEX_IO_WRITEBACK,
+	FUSEX_IO_DIRECT,
 };
 
 static const struct file_operations fusex_fops_writeback;
+static const struct file_operations fusex_fops_direct;
 static const struct address_space_operations fusex_aops_writeback;
+static const struct address_space_operations fusex_aops_direct;
 
 #define ADD_IN_ARG(_args, _size, _value) \
 	(*NEXT_IN_ARG(&(_args)) = (struct fuse_in_arg) { .size = (_size), .value = (_value) })
@@ -992,17 +998,68 @@ static const struct address_space_operations fusex_aops_writeback = {
 };
 
 /*
- * Resolve the mount-default I/O flavor. Today there is only one;
- * additional flavors will extend this switch as they land.
+ * Direct flavor — uncached read/write. Wraps fusex_direct_IO so direct
+ * files reach it through file->f_op->{read,write}_iter instead of the
+ * legacy aops->direct_IO callback. The aops is intentionally empty so
+ * nothing can sneak the file back into the page cache.
+ */
+static ssize_t fusex_direct_read_iter(struct kiocb *iocb, struct iov_iter *to)
+{
+	return fusex_direct_IO(iocb, to);
+}
+
+static ssize_t fusex_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+	ssize_t ret;
+
+	inode_lock(inode);
+	ret = generic_write_checks(iocb, from);
+	if (ret > 0)
+		ret = fusex_direct_IO(iocb, from);
+	inode_unlock(inode);
+	return ret;
+}
+
+static const struct file_operations fusex_fops_direct = {
+	.read_iter	= fusex_direct_read_iter,
+	.write_iter	= fusex_direct_write_iter,
+	.llseek		= generic_file_llseek,
+	.fsync		= simple_fsync_noflush,
+	.fallocate	= fusex_file_fallocate,
+	.open		= fusex_file_open,
+	.release	= fusex_file_release,
+};
+
+static const struct address_space_operations fusex_aops_direct = {
+	/* No callbacks: I/O bypasses the page cache via the fops above. */
+};
+
+/*
+ * Resolve the mount-default I/O flavor.
  */
 static enum fusex_io_flavor fusex_mount_io_flavor(const struct fuse_conn *fc)
 {
 	return FUSEX_IO_WRITEBACK;
 }
 
+/*
+ * Resolve the per-file I/O flavor. Starts from the mount default and
+ * narrows to DIRECT when the daemon set FOPEN_DIRECT_IO or the open
+ * was O_DIRECT.
+ */
+static enum fusex_io_flavor fusex_file_io_flavor(const struct file *file,
+						 const struct fuse_file *ff)
+{
+	if ((file->f_flags & O_DIRECT) || (ff->open_flags & FOPEN_DIRECT_IO))
+		return FUSEX_IO_DIRECT;
+	return fusex_mount_io_flavor(get_fuse_conn(file_inode(file)));
+}
+
 static const struct file_operations *fusex_fops_for(enum fusex_io_flavor f)
 {
 	switch (f) {
+	case FUSEX_IO_DIRECT:	 return &fusex_fops_direct;
 	case FUSEX_IO_WRITEBACK: return &fusex_fops_writeback;
 	}
 	return &fusex_fops_writeback;
@@ -1012,6 +1069,7 @@ static const struct address_space_operations *
 fusex_aops_for(enum fusex_io_flavor f)
 {
 	switch (f) {
+	case FUSEX_IO_DIRECT:	 return &fusex_aops_direct;
 	case FUSEX_IO_WRITEBACK: return &fusex_aops_writeback;
 	}
 	return &fusex_aops_writeback;
@@ -1939,6 +1997,11 @@ static int fusex_file_open(struct inode *inode, struct file *file)
 	err = fusex_send_open(ff, inode, file->f_flags);
 	if (err)
 		return err;
+
+	/* Narrow to DIRECT per-fd if asked. Only file->f_op is swapped;
+	 * the inode's i_fop / a_ops stay on the mount default. */
+	if (fusex_file_io_flavor(file, ff) == FUSEX_IO_DIRECT)
+		file->f_op = fusex_fops_for(FUSEX_IO_DIRECT);
 
 	/*
 	 * Writeback runs without a struct file, so fusex_writepages picks
