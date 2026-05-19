@@ -11,9 +11,12 @@
 #include <linux/xxhash.h>
 #include <linux/pagemap.h>
 #include <linux/exportfs.h>
+#include <linux/iomap.h>
 #include <linux/iversion.h>
 #include <linux/posix_acl_xattr.h>
+#include <linux/sched/signal.h>
 #include <linux/statfs.h>
+#include <linux/task_io_accounting_ops.h>
 #include <linux/falloc.h>
 #include <linux/fs_parser.h>
 #include <uapi/linux/magic.h>
@@ -47,19 +50,37 @@ static int fusex_file_release(struct inode *inode, struct file *file);
  *                 iov_iter is shipped to the daemon as a multi-folio
  *                 FUSE_READ/FUSE_WRITE batch. Selected per-file when the
  *                 daemon returns FOPEN_DIRECT_IO or the open was O_DIRECT.
+ *
+ *   IOMAP         like WRITEBACK but builds read and write paths on top
+ *                 of fs/iomap. read_folio / readahead are driven by
+ *                 iomap_read_folio / iomap_readahead, and write_iter
+ *                 goes through iomap_file_buffered_write, which gives
+ *                 large folios granular dirty tracking and uptodate
+ *                 reads. writepages keeps the multi-folio FUSE_WRITE
+ *                 batcher from WRITEBACK. Selected per-mount when the
+ *                 enable_iomap module parameter is on and the daemon
+ *                 negotiated FUSE_WRITEBACK_CACHE.
  */
 enum fusex_io_flavor {
 	FUSEX_IO_WRITEBACK,
 	FUSEX_IO_WRITETHROUGH,
 	FUSEX_IO_DIRECT,
+	FUSEX_IO_IOMAP,
 };
 
 static const struct file_operations fusex_fops_writeback;
 static const struct file_operations fusex_fops_writethrough;
 static const struct file_operations fusex_fops_direct;
+static const struct file_operations fusex_fops_iomap;
 static const struct address_space_operations fusex_aops_writeback;
 static const struct address_space_operations fusex_aops_writethrough;
 static const struct address_space_operations fusex_aops_direct;
+static const struct address_space_operations fusex_aops_iomap;
+
+static bool __read_mostly enable_iomap;
+module_param(enable_iomap, bool, 0644);
+MODULE_PARM_DESC(enable_iomap,
+		 "Drive cached I/O through fs/iomap (granular dirty tracking on large folios)");
 
 #define ADD_IN_ARG(_args, _size, _value) \
 	(*NEXT_IN_ARG(&(_args)) = (struct fuse_in_arg) { .size = (_size), .value = (_value) })
@@ -1103,12 +1124,166 @@ static const struct address_space_operations fusex_aops_writethrough = {
 };
 
 /*
+ * Iomap flavor — cached reads and writes driven through fs/iomap.
+ *
+ * iomap_begin returns a trivial 1:1 mapping (the daemon owns the actual
+ * storage, so we just declare "logical offset == file offset"). All the
+ * useful work happens in the read_folio_range hooks, which dispatch the
+ * single-folio FUSE_READ / partial-folio reads needed by the iomap state
+ * machine. write_iter delegates to iomap_file_buffered_write so large
+ * folios get granular uptodate / dirty tracking; the writeback-out side
+ * still uses the multi-folio fusex_writepages batcher from the
+ * WRITEBACK flavor, since iomap_writepages assumes a bio-backed device.
+ */
+static int fusex_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
+			     unsigned int flags, struct iomap *iomap,
+			     struct iomap *srcmap)
+{
+	iomap->type = IOMAP_MAPPED;
+	iomap->offset = offset;
+	iomap->length = length;
+	return 0;
+}
+
+static const struct iomap_ops fusex_iomap_ops = {
+	.iomap_begin = fusex_iomap_begin,
+};
+
+/*
+ * Read-side callback: iomap calls this for each folio range that needs
+ * data, either from iomap_read_folio (single folio) or iomap_readahead
+ * (each folio of a readahead batch). We dispatch a synchronous
+ * single-folio FUSE_READ via fusex_send_read and let iomap mark the
+ * range uptodate.
+ */
+static int fusex_iomap_read_folio_range(const struct iomap_iter *iter,
+					struct iomap_read_folio_ctx *ctx,
+					size_t len)
+{
+	struct folio *folio = ctx->cur_folio;
+	struct inode *inode = folio->mapping->host;
+	loff_t pos = iter->pos;
+	size_t off = offset_in_folio(folio, pos);
+	struct file *file = ctx->read_ctx;
+	int ret;
+
+	ret = fusex_send_read(inode, pos, file, folio, off, len);
+	if (!ret)
+		iomap_finish_folio_read(folio, off, len, 0);
+	return ret;
+}
+
+static const struct iomap_read_ops fusex_iomap_read_ops = {
+	.read_folio_range = fusex_iomap_read_folio_range,
+};
+
+/*
+ * Write-side helper: iomap_file_buffered_write needs to read in
+ * unwritten portions of a folio before letting the caller overwrite
+ * part of it. Synchronous and per-folio, like the read path.
+ */
+static int fusex_iomap_read_folio_range_wr(const struct iomap_iter *iter,
+					   struct folio *folio, loff_t pos,
+					   size_t len)
+{
+	struct file *file = iter->private;
+	struct inode *inode = file_inode(file);
+	size_t off = offset_in_folio(folio, pos);
+
+	return fusex_send_read(inode, pos, file, folio, off, len);
+}
+
+static const struct iomap_write_ops fusex_iomap_write_ops = {
+	.read_folio_range = fusex_iomap_read_folio_range_wr,
+};
+
+static int fusex_iomap_read_folio(struct file *file, struct folio *folio)
+{
+	struct iomap_read_folio_ctx ctx = {
+		.cur_folio = folio,
+		.ops = &fusex_iomap_read_ops,
+		.read_ctx = file,
+	};
+
+	iomap_read_folio(&fusex_iomap_ops, &ctx, NULL);
+	return 0;
+}
+
+static void fusex_iomap_readahead(struct readahead_control *rac)
+{
+	struct iomap_read_folio_ctx ctx = {
+		.ops = &fusex_iomap_read_ops,
+		.rac = rac,
+		.read_ctx = rac->file,
+	};
+
+	iomap_readahead(&fusex_iomap_ops, &ctx, NULL);
+}
+
+/*
+ * iomap write path mirrors generic_file_write_iter's structure
+ * (inode lock, generic_write_checks, kiocb_modified, ..._sync) since
+ * iomap_file_buffered_write doesn't drive any of that itself.
+ */
+static ssize_t fusex_write_iter_iomap(struct kiocb *iocb, struct iov_iter *from)
+{
+	struct file *file = iocb->ki_filp;
+	struct inode *inode = file_inode(file);
+	ssize_t count, ret;
+
+	inode_lock(inode);
+	count = generic_write_checks(iocb, from);
+	if (count <= 0) {
+		ret = count;
+		goto out_unlock;
+	}
+	task_io_account_write(count);
+
+	ret = kiocb_modified(iocb);
+	if (ret)
+		goto out_unlock;
+
+	ret = iomap_file_buffered_write(iocb, from, &fusex_iomap_ops,
+					&fusex_iomap_write_ops, file);
+out_unlock:
+	inode_unlock(inode);
+	if (ret > 0)
+		ret = generic_write_sync(iocb, ret);
+	return ret;
+}
+
+static const struct file_operations fusex_fops_iomap = {
+	.read_iter	= generic_file_read_iter,
+	.write_iter	= fusex_write_iter_iomap,
+	.splice_read	= filemap_splice_read,
+	.splice_write	= iter_file_splice_write,
+	.llseek		= generic_file_llseek,
+	.mmap_prepare	= generic_file_mmap_prepare,
+	.fsync		= simple_fsync_noflush,
+	.fallocate	= fusex_file_fallocate,
+	.open		= fusex_file_open,
+	.release	= fusex_file_release,
+};
+
+static const struct address_space_operations fusex_aops_iomap = {
+	.read_folio	= fusex_iomap_read_folio,
+	.readahead	= fusex_iomap_readahead,
+	.writepages	= fusex_writepages,
+	.dirty_folio	= filemap_dirty_folio,
+	.migrate_folio	= filemap_migrate_folio,
+};
+
+/*
  * Resolve the mount-default I/O flavor.
+ *
+ *   FUSE_WRITEBACK_CACHE negotiated + enable_iomap=Y  →  IOMAP
+ *   FUSE_WRITEBACK_CACHE negotiated + enable_iomap=N  →  WRITEBACK
+ *   FUSE_WRITEBACK_CACHE not negotiated               →  WRITETHROUGH
  */
 static enum fusex_io_flavor fusex_mount_io_flavor(const struct fuse_conn *fc)
 {
 	if (fc->writeback_cache)
-		return FUSEX_IO_WRITEBACK;
+		return enable_iomap ? FUSEX_IO_IOMAP : FUSEX_IO_WRITEBACK;
 	return FUSEX_IO_WRITETHROUGH;
 }
 
@@ -1130,6 +1305,7 @@ static const struct file_operations *fusex_fops_for(enum fusex_io_flavor f)
 	switch (f) {
 	case FUSEX_IO_DIRECT:	    return &fusex_fops_direct;
 	case FUSEX_IO_WRITETHROUGH: return &fusex_fops_writethrough;
+	case FUSEX_IO_IOMAP:	    return &fusex_fops_iomap;
 	case FUSEX_IO_WRITEBACK:    return &fusex_fops_writeback;
 	}
 	return &fusex_fops_writeback;
@@ -1141,6 +1317,7 @@ fusex_aops_for(enum fusex_io_flavor f)
 	switch (f) {
 	case FUSEX_IO_DIRECT:	    return &fusex_aops_direct;
 	case FUSEX_IO_WRITETHROUGH: return &fusex_aops_writethrough;
+	case FUSEX_IO_IOMAP:	    return &fusex_aops_iomap;
 	case FUSEX_IO_WRITEBACK:    return &fusex_aops_writeback;
 	}
 	return &fusex_aops_writeback;
