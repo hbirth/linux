@@ -1491,6 +1491,28 @@ static void fuse_uring_send_in_task(struct io_tw_req tw_req, io_tw_token_t tw)
 	fuse_uring_send(ent, cmd, err, issue_flags);
 }
 
+/*
+ * The request was already copied to the ring buffer in the submitter's
+ * context, only the io_uring cmd completion is left to do.
+ * io_uring_cmd_done() must not run in the submitter's context as it would
+ * have to take ctx->uring_lock (io_uring_cmd_del_cancelable()) - a mutex
+ * the ring task holds across its whole submission path and frequently gets
+ * preempted under while the just-woken submitter runs.
+ */
+static void fuse_uring_send_prepared_in_task(struct io_tw_req tw_req,
+					     io_tw_token_t tw)
+{
+	unsigned int issue_flags = IO_URING_CMD_TASK_WORK_ISSUE_FLAGS;
+	struct io_uring_cmd *cmd = io_uring_cmd_from_tw(tw_req);
+	struct fuse_ring_ent *ent = uring_cmd_to_ring_ent(cmd);
+	int err = 0;
+
+	if (unlikely(tw.cancel))
+		err = -ECANCELED;
+
+	fuse_uring_send(ent, cmd, err, issue_flags);
+}
+
 static struct fuse_ring_queue *fuse_uring_select_queue(struct fuse_ring *ring,
 						       bool background)
 {
@@ -1590,7 +1612,9 @@ static void fuse_uring_dispatch_ent(struct fuse_ring_ent *ent, bool bg)
 						 IO_URING_F_UNLOCKED);
 			return;
 		}
-		fuse_uring_send(ent, cmd, 0, IO_URING_F_UNLOCKED);
+		uring_cmd_set_ring_ent(cmd, ent);
+		io_uring_cmd_complete_in_task(cmd,
+					      fuse_uring_send_prepared_in_task);
 	}
 }
 
