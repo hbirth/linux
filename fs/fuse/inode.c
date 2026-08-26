@@ -370,7 +370,14 @@ static void fuse_change_attributes_common_sx(struct inode *inode,
 		}
 	}
 
-	/* Common fields for both statx and getattr */
+	/*
+	 * Common fields for both statx and getattr.
+	 *
+	 * inode->i_blkbits, which is what the page cache is tracked in,
+	 * stays at the superblock block size; FUSE_INIT refuses a writeback
+	 * connection whose block is not a page.  What the server named per
+	 * inode is reported as st_blksize out of fi->cached_i_blkbits.
+	 */
 	if (attr->blksize != 0)
 		fi->cached_i_blkbits = ilog2(attr->blksize);
 	else
@@ -1882,8 +1889,31 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 			}
 			if (flags & FUSE_ASYNC_DIO)
 				fc->async_dio = 1;
-			if (flags & FUSE_WRITEBACK_CACHE)
+			if (flags & FUSE_WRITEBACK_CACHE) {
+				/*
+				 * A buffered write goes through iomap, which
+				 * tracks a folio a block at a time and fills
+				 * any block the write covers only part of.
+				 * Writeback then sends whole dirty blocks.
+				 * Both of those are cut at the page in this
+				 * filesystem: fuse_dlm_buffered_write() sends
+				 * the unaligned edges of a write to the server
+				 * itself so that no partly written block is
+				 * ever dirtied, and it cuts at PAGE_SIZE.
+				 *
+				 * A block that is not a page breaks that, and
+				 * quietly: the fill would come back for the
+				 * remainder of an edge block, from a server
+				 * that need not hold anything there.  Refuse
+				 * the connection instead.
+				 */
+				if (fm->sb->s_blocksize_bits != PAGE_SHIFT) {
+					pr_err("fuse: writeback cache needs a page sized block, got %lu\n",
+					       fm->sb->s_blocksize);
+					ok = false;
+				}
 				fc->writeback_cache = 1;
+			}
 			if (flags & FUSE_PARALLEL_DIROPS)
 				fc->parallel_dirops = 1;
 			if (flags & FUSE_HANDLE_KILLPRIV)
