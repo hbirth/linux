@@ -373,15 +373,17 @@ void fuse_dev_queue_interrupt(struct fuse_iqueue *fiq, struct fuse_req *req)
 /*
  * fuse_args_to_req() assigns the unique already, so that the early tracepoints
  * see it.  Assign here only for requests that did not pass through it.
+ *
+ * The send is not traced here: this runs where a request is queued, which
+ * trace_fuse_request_enqueue() already marks.  trace_fuse_request_send()
+ * belongs where the request reaches the server, in fuse_dev_do_read() and
+ * fuse_uring_send().
  */
 static inline void fuse_request_assign_unique_locked(struct fuse_iqueue *fiq,
 						     struct fuse_req *req)
 {
 	if (!req->in.h.unique && req->in.h.opcode != FUSE_NOTIFY_REPLY)
 		req->in.h.unique = fuse_get_unique_locked(fiq);
-
-	/* tracepoint captures in.h.unique and in.h.len */
-	trace_fuse_request_send(req);
 }
 
 inline void fuse_request_assign_unique(struct fuse_iqueue *fiq,
@@ -389,9 +391,6 @@ inline void fuse_request_assign_unique(struct fuse_iqueue *fiq,
 {
 	if (!req->in.h.unique && req->in.h.opcode != FUSE_NOTIFY_REPLY)
 		req->in.h.unique = fuse_get_unique(fiq);
-
-	/* tracepoint captures in.h.unique and in.h.len */
-	trace_fuse_request_send(req);
 }
 EXPORT_SYMBOL_GPL(fuse_request_assign_unique);
 
