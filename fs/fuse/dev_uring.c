@@ -29,7 +29,6 @@ MODULE_PARM_DESC(enable_uring,
 /* Number of (re)tries to find a better queue */
 #define FUSE_URING_Q_TRIES 3
 
-
 bool fuse_uring_enabled(void)
 {
 	return enable_uring;
@@ -191,41 +190,6 @@ void fuse_uring_flush_bg(struct fuse_conn *fc)
 	}
 }
 
-/*
- * Copy from memmap.c, should be exported
- */
-static void io_pages_free(struct page ***pages, int npages)
-{
-	struct page **page_array = *pages;
-
-	if (!page_array)
-		return;
-
-	unpin_user_pages(page_array, npages);
-	kvfree(page_array);
-	*pages = NULL;
-}
-
-
-static void fuse_ring_destruct_q_map(struct fuse_queue_map *q_map)
-{
-	free_cpumask_var(q_map->registered_q_mask);
-	kfree(q_map->cpu_to_qid);
-}
-
-static void fuse_uring_destruct_q_masks(struct fuse_ring *ring)
-{
-	int node;
-
-	fuse_ring_destruct_q_map(&ring->q_map);
-
-	if (ring->numa_q_map) {
-		for (node = 0; node < ring->nr_numa_nodes; node++)
-			fuse_ring_destruct_q_map(&ring->numa_q_map[node]);
-		kfree(ring->numa_q_map);
-	}
-}
-
 static bool ent_list_request_expired(struct fuse_conn *fc, struct list_head *list)
 {
 	struct fuse_ring_ent *ent;
@@ -267,6 +231,40 @@ bool fuse_uring_request_expired(struct fuse_conn *fc)
 	}
 
 	return false;
+}
+
+/*
+ * Copy from memmap.c, should be exported
+ */
+static void io_pages_free(struct page ***pages, int npages)
+{
+	struct page **page_array = *pages;
+
+	if (!page_array)
+		return;
+
+	unpin_user_pages(page_array, npages);
+	kvfree(page_array);
+	*pages = NULL;
+}
+
+static void fuse_ring_destruct_q_map(struct fuse_queue_map *q_map)
+{
+	free_cpumask_var(q_map->registered_q_mask);
+	kfree(q_map->cpu_to_qid);
+}
+
+static void fuse_uring_destruct_q_masks(struct fuse_ring *ring)
+{
+	int node;
+
+	fuse_ring_destruct_q_map(&ring->q_map);
+
+	if (ring->numa_q_map) {
+		for (node = 0; node < ring->nr_numa_nodes; node++)
+			fuse_ring_destruct_q_map(&ring->numa_q_map[node]);
+		kfree(ring->numa_q_map);
+	}
 }
 
 void fuse_uring_destruct(struct fuse_conn *fc)
@@ -361,8 +359,8 @@ static struct fuse_ring *fuse_uring_create(struct fuse_conn *fc)
 
 	ring->nr_numa_nodes = num_online_nodes();
 
-	ring->queues = kcalloc(nr_queues, sizeof(struct fuse_ring_queue *),
-		       GFP_KERNEL_ACCOUNT);
+	ring->queues = kzalloc_objs(struct fuse_ring_queue *, nr_queues,
+				    GFP_KERNEL_ACCOUNT);
 	if (!ring->queues)
 		goto out_err;
 
@@ -887,7 +885,6 @@ static int fuse_uring_args_to_ring(struct fuse_ring *ring, struct fuse_req *req,
 	/* copy the payload */
 	err = fuse_copy_args(&cs, num_args, args->in_pages,
 			     (struct fuse_arg *)in_args, 0);
-	fuse_copy_finish(&cs);
 	if (err) {
 		pr_info_ratelimited("%s fuse_copy_args failed\n", __func__);
 		goto copy_finish;
