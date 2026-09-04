@@ -1135,6 +1135,46 @@ static int fuse_read_folio_merge(struct file *file, struct folio *folio)
 }
 
 /**
+ * fuse_read_grant - take the grant a page cache fill runs under
+ * @file: file to read through
+ * @pos: byte offset the read starts at
+ * @count: bytes the read asks for
+ *
+ * ->read_folio and ->readahead are entered with the folios they fill
+ * already locked, and no grant may be asked for under a page lock
+ * (Documentation/filesystems/fuse/fuse-AOP_TRUNCATED_PAGE-reason.txt).
+ * A read asks here, before anything is locked, and the fill paths only
+ * confirm what this took.
+ *
+ * Readahead fills past the end of the read, so ask for a window beyond
+ * it as well, bounded by the file since readahead stops there.  A run of
+ * folios no grant covers is given back unfilled and fetched one folio at
+ * a time, so what is asked for here is what readahead is worth.
+ *
+ * Return: what fuse_get_dlm_lock() returned, 0 when there is nothing to
+ * ask for.
+ */
+static int fuse_read_grant(struct file *file, loff_t pos, size_t count)
+{
+	struct inode *inode = file_inode(file);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	loff_t size = i_size_read(inode);
+	loff_t ahead = (loff_t)file->f_ra.ra_pages << PAGE_SHIFT;
+	loff_t end = pos + count;
+
+	if (!fc->writeback_cache || !fc->dlm)
+		return 0;
+
+	if (end < size)
+		end += min(ahead, size - end);
+
+	if (end <= pos)
+		return 0;
+
+	return fuse_get_dlm_lock(file, pos, end - pos, FUSE_PAGE_LOCK_READ);
+}
+
+/**
  * fuse_read_folio_retry - back off a fill with no grant to run under
  * @file: file to read through
  * @folio: the folio handed over locked, unlocked here
@@ -1163,7 +1203,7 @@ static int fuse_read_folio_retry(struct file *file, struct folio *folio,
 	fuse_dlm_pin(fi, &pin, pos, len);
 	fuse_dlm_unpin(fi);
 
-	err = fuse_get_dlm_lock(file, pos, len, FUSE_PAGE_LOCK_READ);
+	err = fuse_read_grant(file, pos, len);
 	if (err == -ENOSYS)
 		return AOP_TRUNCATED_PAGE;
 	if (err < 0)
@@ -1582,11 +1622,8 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 			return err;
 	}
 
-	/* if we have dlm support acquire a read lock for the area
-	 * we are reading from. */
-	if (fc->writeback_cache && fc->dlm)
-		fuse_get_dlm_lock(file, iocb->ki_pos, iov_iter_count(to),
-				  FUSE_PAGE_LOCK_READ);
+	/* The grant this read and the readahead behind it fill under */
+	fuse_read_grant(file, iocb->ki_pos, iov_iter_count(to));
 
 	/*
 	 * A NOTIFY invalidate racing this read drops the folios it
@@ -3092,8 +3129,10 @@ static ssize_t fuse_splice_read(struct file *in, loff_t *ppos,
 	/* FOPEN_DIRECT_IO overrides FOPEN_PASSTHROUGH */
 	if (fuse_file_passthrough(ff) && !(ff->open_flags & FOPEN_DIRECT_IO))
 		return fuse_passthrough_splice_read(in, ppos, pipe, len, flags);
-	else
-		return filemap_splice_read(in, ppos, pipe, len, flags);
+
+	fuse_read_grant(in, *ppos, len);
+
+	return filemap_splice_read(in, ppos, pipe, len, flags);
 }
 
 static ssize_t fuse_splice_write(struct pipe_inode_info *pipe, struct file *out,
@@ -4000,9 +4039,22 @@ static vm_fault_t fuse_page_mkwrite(struct vm_fault *vmf)
 	return VM_FAULT_LOCKED;
 }
 
+/*
+ * A read fault fills the page cache through ->read_folio and
+ * ->readahead, which run with the folios locked.  Ask for the grant they
+ * fill under before filemap_fault() locks any of them.
+ */
+static vm_fault_t fuse_filemap_fault(struct vm_fault *vmf)
+{
+	fuse_read_grant(vmf->vma->vm_file, (loff_t)vmf->pgoff << PAGE_SHIFT,
+			PAGE_SIZE);
+
+	return filemap_fault(vmf);
+}
+
 static const struct vm_operations_struct fuse_file_vm_ops = {
 	.close		= fuse_vma_close,
-	.fault		= filemap_fault,
+	.fault		= fuse_filemap_fault,
 	.map_pages	= filemap_map_pages,
 	.page_mkwrite	= fuse_page_mkwrite,
 };
