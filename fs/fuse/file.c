@@ -1595,8 +1595,13 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 			return err;
 	}
 
-	/* The grant this read and the readahead behind it fill under */
-	fuse_read_grant(file, iocb->ki_pos, iov_iter_count(to));
+	/*
+	 * The grant this read and the readahead behind it fill under.  Not
+	 * for O_DIRECT, which takes no DLM lock at all: it fills no page
+	 * cache, and what it reads is the server's to order.
+	 */
+	if (!(iocb->ki_flags & IOCB_DIRECT))
+		fuse_read_grant(file, iocb->ki_pos, iov_iter_count(to));
 
 	/*
 	 * A NOTIFY invalidate racing this read drops the folios it
@@ -2528,8 +2533,13 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	 * too early, an expanding write would fall through to a READ of a
 	 * range that cannot hold data -- which fails outright on a handle
 	 * the client opened write-only.
+	 *
+	 * O_DIRECT takes no DLM lock at all, here or anywhere: it dirties
+	 * no page cache, so there is nothing for a grant to cover, and its
+	 * bytes are the server's to order against the rest of the cluster.
 	 */
-	if (writeback && fc->dlm && !(iocb->ki_flags & IOCB_APPEND)) {
+	if (writeback && fc->dlm && !(iocb->ki_flags & IOCB_DIRECT) &&
+	    !(iocb->ki_flags & IOCB_APPEND)) {
 		err = fuse_cache_wr_dlm_lock(file, iocb->ki_pos,
 					     iov_iter_count(from));
 		if (err)
@@ -2553,7 +2563,8 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	 * lock does not pin i_size either: attribute replies move it under
 	 * fi->lock alone.  Take the grant here, where the range is settled.
 	 */
-	if (writeback && fc->dlm && (iocb->ki_flags & IOCB_APPEND)) {
+	if (writeback && fc->dlm && !(iocb->ki_flags & IOCB_DIRECT) &&
+	    (iocb->ki_flags & IOCB_APPEND)) {
 		err = fuse_cache_wr_dlm_lock(file, iocb->ki_pos, count);
 		if (err)
 			goto out;
