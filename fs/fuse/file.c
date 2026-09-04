@@ -1427,8 +1427,8 @@ static int fuse_send_readpages(struct fuse_io_args *ia, struct file *file,
 	WARN_ON((loff_t) (pos + count) < 0);
 
 	/*
-	 * The grant fuse_readahead() took, confirmed under a pin and held
-	 * until the reply has filled the folios.  A revoke of the range
+	 * The grant the read took in fuse_read_grant(), confirmed under a
+	 * pin and held until the reply has filled the folios.  A revoke of the range
 	 * waits for that, so the reply cannot be fetched under a grant the
 	 * server has since handed on, and cannot land behind a sweep that
 	 * would leave the folios uptodate and covered by nothing.
@@ -1484,49 +1484,21 @@ static void fuse_readahead(struct readahead_control *rac)
 		return;
 
 	/*
-	 * Readahead fills the page cache past the range the reader locked,
-	 * so take a DLM read grant over the whole window here too.  Folios
+	 * Readahead fills the page cache past the range the reader asked
+	 * for, and what lands there has to be covered by a grant: folios
 	 * the server handed out no lock for are folios it will not revoke
 	 * when a remote node writes them, and a later read would be served
-	 * from stale cache.  Take the grant before any folio is pulled off
-	 * @rac, so the window is either fully covered or not populated.
+	 * from stale cache.
 	 *
-	 * Speculative pages are not worth serving uncovered: on a failed
-	 * request drop the window and let read_pages() clean up the folios
-	 * left in @rac.  A server without DLM support answers -ENOSYS and
-	 * clears fc->dlm, which is not a failure.
+	 * No grant is asked for here.  ->readahead is entered with every
+	 * folio of the window already locked, and none may be asked for
+	 * under a page lock; the read this window belongs to took one over
+	 * it in fuse_read_grant(), before the page cache was entered.
 	 *
-	 * The grant is only asked for here.  Confirming it and holding it
-	 * against a revoke is fuse_send_readpages(), one run of folios at a
-	 * time, since that is where the request the reply fills them from
-	 * goes out; a run it declines ends the window.
-	 *
-	 * ->readahead is entered with every folio of the window already
-	 * locked, and pulling one off @rac is what unlocks it, so the round
-	 * trip is taken under those locks.  See the readahead line of
-	 * Documentation/filesystems/locking.rst.
-	 *
-	 * What keeps that from closing a cycle is the direction a revoke
-	 * travels.  This asks for a read grant on a range it holds nothing
-	 * on, so the lock in the way is another node's, and the revoke that
-	 * frees it is sent there.  Nothing here has to run for this request
-	 * to be answered, so the folios stay locked only for as long as the
-	 * round trip.
-	 *
-	 * A window this already holds part of is the open edge: the query
-	 * fails for the whole of it, so the request goes out while that part
-	 * is still held, and a revoke for that part is sent here.  Whether
-	 * the server can answer while a revoke of its own is outstanding is
-	 * not something this side can know.
+	 * What that left uncovered fuse_send_readpages() declines, one run
+	 * of folios at a time, and those folios go back unfilled for
+	 * fuse_read_folio() to fetch with no folio held.
 	 */
-	if (fc->writeback_cache && fc->dlm) {
-		int err = fuse_get_dlm_lock(rac->file, readahead_pos(rac),
-					    readahead_length(rac),
-					    FUSE_PAGE_LOCK_READ);
-
-		if (err < 0 && err != -ENOSYS)
-			return;
-	}
 
 	max_pages = min_t(unsigned int, fc->max_pages,
 			fc->max_read / PAGE_SIZE);
