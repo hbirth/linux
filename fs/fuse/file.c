@@ -3109,6 +3109,11 @@ static void fuse_writepage_free(struct fuse_writepage_args *wpa)
 	kfree(wpa);
 }
 
+/* Defined below, with the writeback paths that are its other callers. */
+static void fuse_writeback_redirty(struct fuse_conn *fc,
+				   struct writeback_control *wbc,
+				   struct folio *folio);
+
 static void fuse_writepage_finish(struct fuse_writepage_args *wpa)
 {
 	struct fuse_args_pages *ap = &wpa->ia.ap;
@@ -3231,6 +3236,29 @@ static void fuse_writepage_end(struct fuse_mount *fm, struct fuse_args *args,
 	struct inode *inode = wpa->inode;
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_args_pages *ap = &wpa->ia.ap;
+
+	/*
+	 * A server that acknowledges fewer bytes than it was sent has not
+	 * taken the rest.  The write path acts on that (fuse_send_write()
+	 * returns the short count and fuse_perform_write() stops on it);
+	 * writeback had no caller to report it to and ended every folio
+	 * clean, so the tail was dropped with nothing to say so and a later
+	 * fsync() succeeded over the hole.
+	 *
+	 * Put the folios the reply does not reach back on the dirty list so
+	 * the bytes survive for another pass, and record the error: the
+	 * redirty lands after the wait an fsync() in progress already did,
+	 * which would otherwise return success over them again.
+	 */
+	if (!error && wpa->ia.write.out.size < wpa->ia.write.in.size) {
+		unsigned int i = wpa->ia.write.out.size >> PAGE_SHIFT;
+
+		for (; i < ap->num_pages; i++)
+			fuse_writeback_redirty(fc, NULL,
+					       page_folio(ap->pages[i]));
+		error = -EIO;
+	}
 
 	mapping_set_error(inode->i_mapping, error);
 	/*
