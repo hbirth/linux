@@ -627,6 +627,30 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 
 	oldsize = inode->i_size;
 	/*
+	 * fuse_attr_cache_mask() answered before the grant query slept, and a
+	 * write below EOF bumps neither fi->attr_version nor
+	 * fi->size_extenders: it extends nothing, so the version check cannot
+	 * drop the reply and the count cannot hold the size.  Folios can have
+	 * been dirtied in the doomed range since the answer, and
+	 * truncate_pagecache() below throws them away with no error to report
+	 * it.
+	 *
+	 * Re-test here instead, where nothing sleeps between the answer and
+	 * the truncate acting on it, and keep the local size when the range
+	 * still holds bytes the server has not seen.  A remote truncate is
+	 * unaffected: it revokes first, and the revoke launders and drops the
+	 * range, so there is nothing here to find.
+	 */
+	if (have_size && !(cache_mask & STATX_SIZE) && fc->dlm &&
+	    fc->writeback_cache && S_ISREG(inode->i_mode) &&
+	    (loff_t) attr->size < oldsize &&
+	    filemap_range_needs_writeback(inode->i_mapping, attr->size,
+					  oldsize - 1)) {
+		cache_mask |= STATX_SIZE;
+		attr->size = oldsize;
+	}
+
+	/*
 	 * In case of writeback_cache enabled, the cached writes beyond EOF
 	 * extend local i_size without keeping userspace server in sync. So,
 	 * attr->size coming from server can be stale. We cannot trust it.
@@ -651,7 +675,23 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 		bool have_mtime = !sx || (sx->mask & STATX_MTIME);
 
 		if (have_size && oldsize != attr->size) {
-			truncate_pagecache(inode, attr->size);
+			/*
+			 * Not under DLM.  This runs after fi->lock is
+			 * dropped and takes nothing a writer holds, so a
+			 * folio dirtied between the decision and the walk,
+			 * or during it, is discarded with no error to report
+			 * it.  A real truncate may do this because
+			 * fuse_set_nowrite() and i_rwsem hold the writers
+			 * off; an attribute reply holds off nothing.
+			 *
+			 * Keeping the folios costs nothing either way.  If
+			 * the size was wrong they are written back and the
+			 * size recovers; if it was right, the revoke that had
+			 * to precede it already dropped the range and there
+			 * is nothing here to discard.
+			 */
+			if (!(fc->dlm && fc->writeback_cache))
+				truncate_pagecache(inode, attr->size);
 			/*
 			 * A size that differs from the cached one is
 			 * upstream's evidence that another client wrote
