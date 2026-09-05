@@ -248,7 +248,20 @@ struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
 
 		if (inode && fc->compound_open_getattr) {
 			struct fuse_attr_out attr_outarg;
+			u64 attr_version;
 
+			/*
+			 * Sampled before the request, the way every other
+			 * caller does it.  fuse_change_attributes_i() drops
+			 * a reply whose version is older than the inode's,
+			 * and a version read once the reply is already back
+			 * is never older than anything that moved while it
+			 * was on the wire -- the reply would be applied
+			 * however stale it had become, and under DLM that
+			 * means a size from before the open shrinking
+			 * i_size back under the writers.
+			 */
+			attr_version = fuse_get_attr_version(fc);
 			err = fuse_compound_open_getattr(fm, nodeid, open_flags,
 							 opcode, ff,
 							 &attr_outarg, outargp);
@@ -258,7 +271,7 @@ struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
 				fuse_change_attributes(inode, &attr_outarg.attr,
 						       NULL,
 						       ATTR_TIMEOUT(&attr_outarg),
-						       fuse_get_attr_version(fc));
+						       attr_version);
 		}
 		if (err == -ENOSYS) {
 			err = fuse_send_open(fm, nodeid, open_flags, opcode, outargp);
