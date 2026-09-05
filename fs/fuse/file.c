@@ -1903,6 +1903,62 @@ static int fuse_cache_wr_dlm_lock(struct file *file, loff_t pos, size_t len)
 }
 
 /*
+ * How many times a writer confirms its grant again before giving up on
+ * the range.  A pass costs a round trip only when the grant has gone,
+ * which is a revoke landing between the request and the confirmation.
+ */
+#define FUSE_DLM_PIN_RETRIES 16
+
+/*
+ * Pin [@pos, @pos + @len) with the grant over it confirmed, so the bytes
+ * can be dirtied under a lock that cannot be taken away meanwhile; see
+ * fuse_dlm_pin().  @pin is the caller's storage for the pin, which it
+ * drops with fuse_dlm_unpin() once the bytes are dirty.
+ *
+ * The grant is asked for again when it has gone, and the pin must not be
+ * held across that request: it is answered by the server the revoke
+ * waiting for the pin came from.  So confirm and request alternate, and
+ * no folio may be held here.
+ */
+static int fuse_dlm_pin_write(struct file *file, struct fuse_dlm_span *pin,
+			      loff_t pos, size_t len)
+{
+	struct inode *inode = file_inode(file);
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	unsigned int tries = FUSE_DLM_PIN_RETRIES;
+	int err;
+
+	for (;;) {
+		fuse_dlm_pin(fi, pin, pos, len);
+		/*
+		 * A server that turned out to have no DLM leaves nothing to
+		 * confirm, and the pin still pairs with the caller's unpin.
+		 */
+		if (!fc->dlm ||
+		    fuse_dlm_lock_is_held(fi, pos, len, FUSE_PAGE_LOCK_WRITE))
+			return 0;
+		fuse_dlm_unpin(fi);
+
+		if (!tries--)
+			return -EIO;
+
+		err = fuse_get_dlm_lock(file, pos, len, FUSE_PAGE_LOCK_WRITE);
+		if (err < 0 && err != -ENOSYS)
+			return err;
+		if (err > 0) {
+			/*
+			 * Granted but unrecorded, so there is nothing for the
+			 * confirmation above to find.  The range is covered
+			 * cluster-wide; pin and proceed.
+			 */
+			fuse_dlm_pin(fi, pin, pos, len);
+			return 0;
+		}
+	}
+}
+
+/*
  * Write @len bytes of @from at the current iocb position, either straight
  * through to the server (@through, for an unaligned edge) or into the page
  * cache (@through == false, for the aligned interior).  Both primitives
@@ -1910,15 +1966,31 @@ static int fuse_cache_wr_dlm_lock(struct file *file, loff_t pos, size_t len)
  * temporarily capped to @len so the unconsumed tail stays available for the
  * next chunk.  Returns bytes written (< @len means a short write, the caller
  * stops) or a negative error.
+ *
+ * The grant over the chunk is confirmed and pinned across both, so the
+ * bytes cannot become the server's under a revoke that has already been
+ * answered.  For the cached interior that is one pin for the whole chunk:
+ * ->write_begin and ->write_end have nowhere to keep a node that spans the
+ * pair, and generic_perform_write() runs between them.  For the edges the
+ * bytes never enter the page cache at all, so a revoke cannot find them by
+ * flushing it and the pin has to cover the FUSE_WRITE itself, which is the
+ * reply the revoke already waits for when the same bytes go through
+ * writeback.
  */
 static ssize_t fuse_dlm_write_chunk(struct kiocb *iocb, struct iov_iter *from,
 				    size_t len, bool through)
 {
+	struct file *file = iocb->ki_filp;
+	struct fuse_dlm_span pin;
 	size_t hidden;
 	ssize_t res;
 
 	if (!len)
 		return 0;
+
+	res = fuse_dlm_pin_write(file, &pin, iocb->ki_pos, len);
+	if (res)
+		return res;
 
 	/* Cap the iterator to this chunk, keeping the tail for later chunks. */
 	hidden = iov_iter_count(from) - len;
@@ -1928,6 +2000,8 @@ static ssize_t fuse_dlm_write_chunk(struct kiocb *iocb, struct iov_iter *from,
 	/* Restore from the iterator's own residue, so short writes/errors
 	 * (which leave it partly advanced) reexpand to the exact remainder. */
 	iov_iter_reexpand(from, iov_iter_count(from) + hidden);
+
+	fuse_dlm_unpin(get_fuse_inode(file_inode(file)));
 
 	return res;
 }
@@ -1957,7 +2031,8 @@ static ssize_t fuse_dlm_buffered_write(struct kiocb *iocb,
 
 	/* No whole folio inside the write: nothing cacheable, all through. */
 	if (mid_end <= mid_start)
-		return fuse_perform_write(iocb, from, true);
+		return fuse_dlm_write_chunk(iocb, from,
+					    iov_iter_count(from), true);
 
 	/* Unaligned head [pos, mid_start): through. */
 	res = fuse_dlm_write_chunk(iocb, from, mid_start - pos, true);
@@ -1967,13 +2042,25 @@ static ssize_t fuse_dlm_buffered_write(struct kiocb *iocb,
 	if (res < mid_start - pos)
 		return total;
 
-	/* Aligned interior [mid_start, mid_end): cached whole folios. */
-	res = fuse_dlm_write_chunk(iocb, from, mid_end - mid_start, false);
-	if (res < 0)
-		return total ? total : res;
-	total += res;
-	if (res < mid_end - mid_start)
-		return total;
+	/*
+	 * Aligned interior [mid_start, mid_end): cached whole folios, taken
+	 * one shard at a time.  fuse_dlm_write_chunk() pins the grant for
+	 * the length of a chunk and a revoke of the range waits for that,
+	 * so the chunk is what bounds how long a large write holds a notify
+	 * up.
+	 */
+	while (mid_start < mid_end) {
+		size_t chunk = min_t(loff_t, mid_end - mid_start,
+				     FUSE_DLM_SHARD_SIZE);
+
+		res = fuse_dlm_write_chunk(iocb, from, chunk, false);
+		if (res < 0)
+			return total ? total : res;
+		total += res;
+		if (res < chunk)
+			return total;
+		mid_start += chunk;
+	}
 
 	/* Unaligned tail [mid_end, end): through. */
 	res = fuse_dlm_write_chunk(iocb, from, end - mid_end, true);
@@ -3054,6 +3141,8 @@ static int fuse_writepage_locked(struct folio *folio)
 	struct fuse_writepage_args *wpa;
 	struct fuse_args_pages *ap;
 	struct fuse_file *ff;
+	struct fuse_dlm_span pin;
+	bool pinned = false;
 	int error = -EIO;
 
 	ff = fuse_write_file_get(fi);
@@ -3068,22 +3157,44 @@ static int fuse_writepage_locked(struct folio *folio)
 	 * no later pass of this submit to defer it to.  Leave the folio dirty
 	 * and report no error: the invalidate that laundered it then finds it
 	 * busy, and an ordinary writeback sends it with a grant of its own.
+	 *
+	 * The grant is pinned from the moment it is found until the folio is
+	 * under writeback, where the revoke waits for it again.
 	 */
 	if (fc->dlm && fc->writeback_cache) {
-		if (!fuse_dlm_lock_is_held(fi, folio_pos(folio),
-					   folio_size(folio),
-					   FUSE_PAGE_LOCK_WRITE)) {
+		loff_t pos = folio_pos(folio);
+		size_t len = folio_size(folio);
+
+		/*
+		 * The revoke handler laundering the range it is taking away.
+		 * That lock is still this client's until the handler returns,
+		 * so send without asking: the record has gone already and
+		 * asking would be a round trip for the very range being
+		 * revoked.  Only for that range, since the latched path
+		 * launders the whole mapping and the rest of it may be
+		 * covered by nothing.
+		 */
+		if (fuse_in_notify_range(pos, len))
+			goto queue;
+
+		pinned = fuse_dlm_trypin(fi, &pin, pos, len);
+		if (pinned && !fuse_dlm_lock_is_held(fi, pos, len,
+						     FUSE_PAGE_LOCK_WRITE)) {
+			fuse_dlm_unpin(fi);
+			pinned = false;
+		}
+
+		if (!pinned) {
 			fuse_file_put(ff, false);
 			fuse_writeback_redirty(fc, NULL, folio);
 			return 0;
 		}
 
-		error = fuse_dlm_regrant_range(ff, inode, folio_pos(folio),
-					       folio_pos(folio) +
-					       folio_size(folio) - 1);
+		error = fuse_dlm_regrant_range(ff, inode, pos, pos + len - 1);
 		if (error < 0 && error != -ENOSYS)
 			goto err_writepage_args;
 	}
+queue:
 
 	wpa = fuse_writepage_args_setup(folio, ff);
 	error = -ENOMEM;
@@ -3094,6 +3205,15 @@ static int fuse_writepage_locked(struct folio *folio)
 	ap->num_pages = 1;
 
 	folio_start_writeback(folio);
+
+	/*
+	 * Under writeback now, so the flush a revoke runs before it takes the
+	 * grant away waits for these bytes.  Nothing further is needed to
+	 * keep them in front of the handover.
+	 */
+	if (pinned)
+		fuse_dlm_unpin(fi);
+
 	fuse_writepage_args_page_fill(wpa, folio, 0);
 
 	spin_lock(&fi->lock);
@@ -3104,6 +3224,8 @@ static int fuse_writepage_locked(struct folio *folio)
 	return 0;
 
 err_writepage_args:
+	if (pinned)
+		fuse_dlm_unpin(fi);
 	fuse_file_put(ff, false);
 err:
 	/*
@@ -3224,6 +3346,8 @@ static int fuse_writepages_fill(struct folio *folio,
 	struct inode *inode = data->inode;
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_dlm_span pin;
+	bool pinned = false;
 	int err;
 
 	if (!data->ff) {
@@ -3264,6 +3388,18 @@ static int fuse_writepages_fill(struct folio *folio,
 		size_t len = folio_size(folio);
 
 		/*
+		 * The revoke handler flushing the range it is taking away.
+		 * That lock is still this client's until the handler returns,
+		 * so send without asking: the record has gone already and
+		 * asking would be a round trip for the very range being
+		 * revoked.  Only for that range, since the latched path
+		 * launders the whole mapping and the rest of it may be
+		 * covered by nothing.
+		 */
+		if (fuse_in_notify_range(pos, len))
+			goto queue;
+
+		/*
 		 * The folio is locked here, and the folios queued before it
 		 * in this pass are under writeback, so a grant this folio
 		 * does not already hold must not be asked for:
@@ -3278,9 +3414,19 @@ static int fuse_writepages_fill(struct folio *folio,
 		 * with no folio held, and the pass that follows sends it.
 		 * Nothing is lost and no error is recorded for a later fsync
 		 * to report.
+		 *
+		 * A refused pin is a revoke of this range draining, and
+		 * leaves the folio in the same place for the same reason.  A
+		 * revoke elsewhere in the file does not refuse it.
 		 */
-		if (!fuse_dlm_lock_is_held(fi, pos, len,
-					   FUSE_PAGE_LOCK_WRITE)) {
+		pinned = fuse_dlm_trypin(fi, &pin, pos, len);
+		if (pinned && !fuse_dlm_lock_is_held(fi, pos, len,
+						     FUSE_PAGE_LOCK_WRITE)) {
+			fuse_dlm_unpin(fi);
+			pinned = false;
+		}
+
+		if (!pinned) {
 			fuse_writeback_redirty(fc, wbc, folio);
 			if (data->regrant_end <= data->regrant_start) {
 				data->regrant_start = pos;
@@ -3308,18 +3454,20 @@ static int fuse_writepages_fill(struct folio *folio,
 		}
 
 		/*
-		 * Held: this walks the record and sends nothing.  It stays a
-		 * call rather than the check above so a grant that arrives
-		 * between them is still used.
+		 * Held, and pinned so it stays held: this walks the record
+		 * and sends nothing.  It stays a call rather than the check
+		 * above so a grant that arrives between them is still used.
 		 */
 		err = fuse_dlm_regrant_range(data->ff, inode, pos,
 					     pos + len - 1);
 		if (err < 0 && err != -ENOSYS) {
 			fuse_writeback_redirty(fc, wbc, folio);
+			fuse_dlm_unpin(fi);
 			goto out_unlock;
 		}
 		err = 0;
 	}
+queue:
 
 	if (wpa && fuse_writepage_need_send(fc, &folio->page, ap, data, wbc)) {
 		fuse_writepages_send(data);
@@ -3331,6 +3479,8 @@ static int fuse_writepages_fill(struct folio *folio,
 		wpa = fuse_writepage_args_setup(folio, data->ff);
 		if (!wpa) {
 			fuse_writeback_redirty(fc, wbc, folio);
+			if (pinned)
+				fuse_dlm_unpin(fi);
 			goto out_unlock;
 		}
 		fuse_file_get(wpa->ia.ff);
@@ -3340,6 +3490,14 @@ static int fuse_writepages_fill(struct folio *folio,
 		ap->num_pages = 0;
 	}
 	folio_start_writeback(folio);
+
+	/*
+	 * Under writeback now, so the flush a revoke runs before it takes
+	 * the grant away waits for these bytes.  Nothing further is needed
+	 * to keep them in front of the handover.
+	 */
+	if (pinned)
+		fuse_dlm_unpin(fi);
 	ap->descs[ap->num_pages].offset = 0;
 	ap->descs[ap->num_pages].length = PAGE_SIZE;
 	ap->pages[ap->num_pages] = &folio->page;
