@@ -322,6 +322,23 @@ struct fuse_inode {
 			 * and every writer clears it.
 			 */
 			atomic_t size_extenders;
+
+			/*
+			 * High water mark of i_size, and the size the
+			 * queued writepage requests are cropped against.
+			 * A truncate lowers it
+			 * (fuse_writeback_crop_truncated()); otherwise it
+			 * only follows i_size back down once no request is
+			 * left to protect (fuse_writepage_end()).
+			 *
+			 * i_size itself cannot serve: with DLM the server's
+			 * size is applied to it (fuse_attr_cache_mask()),
+			 * and a reply that is only behind the local writers
+			 * would have fuse_send_writepage() crop away bytes
+			 * on their way out.  Protected by fi->lock;
+			 * writeback-cache regular files only.
+			 */
+			loff_t wb_crop;
 		};
 
 		/* readdir cache (directory only) */
@@ -1603,6 +1620,23 @@ void fuse_flush_writepages(struct inode *inode);
 
 void fuse_set_nowrite(struct inode *inode);
 void fuse_release_nowrite(struct inode *inode);
+
+/*
+ * A truncate has lowered i_size under fuse_set_nowrite().  That shrink is
+ * the authoritative one: the bytes above it are gone, and the writepage
+ * requests still standing over them are meant to be cropped away rather
+ * than kept.  Let the crop follow i_size back down.
+ *
+ * Every other shrink -- under DLM, any attribute reply that is merely
+ * behind the local writers -- must not, which is what fi->wb_crop is for.
+ * Called under fi->lock; see fuse_flush_writepages().
+ */
+static inline void fuse_writeback_crop_truncated(struct inode *inode,
+						 loff_t size)
+{
+	if (get_fuse_conn(inode)->writeback_cache && S_ISREG(inode->i_mode))
+		get_fuse_inode(inode)->wb_crop = size;
+}
 
 /**
  * Scan all fuse_mounts belonging to fc to find the first where

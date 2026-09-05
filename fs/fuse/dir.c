@@ -2205,6 +2205,7 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		i_size_write(inode, outarg.attr.size);
 
 	if (is_truncate) {
+		fuse_writeback_crop_truncated(inode, outarg.attr.size);
 		/* NOTE: this may release/reacquire fi->lock */
 		__fuse_release_nowrite(inode);
 	}
