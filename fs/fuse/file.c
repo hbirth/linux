@@ -2568,6 +2568,7 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 					generic_perform_write(iocb, from));
 		} else if (through) {
 			struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(iocb);
+			struct fuse_dlm_span pin;
 			loff_t pos = iocb->ki_pos;
 
 			count = iov_iter_count(from);
@@ -2588,8 +2589,23 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 				}
 			}
 
+			/*
+			 * These bytes never enter the page cache, so a revoke
+			 * cannot find them by flushing it, and the grant they
+			 * were taken under can be handed on while they are
+			 * still on the wire.  Hold it across the FUSE_WRITE,
+			 * as the writethrough edges do; a revoke of the range
+			 * waits for the reply.
+			 */
+			err = fuse_dlm_pin_write(file, &pin, pos, count);
+			if (err) {
+				written = err;
+				goto wb_out;
+			}
+
 			written = fuse_direct_io(&io, from, &iocb->ki_pos,
 						 FUSE_DIO_WRITE);
+			fuse_dlm_unpin(fi);
 			if (written < 0) {
 				err = written;
 				goto wb_out;
