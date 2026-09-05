@@ -274,6 +274,21 @@ struct fuse_inode {
 			unsigned int write_stream_run;
 			loff_t write_stream_next;
 			loff_t write_stream_start;
+
+			/*
+			 * Buffered writes that have committed an i_size
+			 * extension and not yet dirtied the folio under
+			 * it.
+			 *
+			 * The DLM path holds i_rwsem shared, so several
+			 * writers extend i_size at once and each one is
+			 * ahead of the server until its bytes are sent.
+			 * While this is non zero the local size wins over
+			 * the server's; see fuse_attr_cache_mask().
+			 * FUSE_I_SIZE_UNSTABLE cannot serve: it is one bit
+			 * and every writer clears it.
+			 */
+			atomic_t size_extenders;
 		};
 
 		/* readdir cache (directory only) */
