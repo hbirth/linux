@@ -1279,8 +1279,8 @@ static int fuse_send_readpages(struct fuse_io_args *ia, struct file *file)
 	WARN_ON((loff_t) (pos + count) < 0);
 
 	/*
-	 * The grant fuse_readahead() took, confirmed under a pin and held
-	 * until the reply has filled the pages.  A revoke of the range
+	 * The grant the read took in fuse_read_grant(), confirmed under a
+	 * pin and held until the reply has filled the pages.  A revoke of the range
 	 * waits for that, so the reply cannot be fetched under a grant the
 	 * server has since handed on, and cannot land behind a sweep that
 	 * would leave the pages uptodate and covered by nothing.
@@ -1392,19 +1392,11 @@ static void fuse_readahead_lookahead(struct file *file, struct inode *inode,
 		return;
 
 	/*
-	 * Same grant the window itself takes: folios the server handed out
-	 * no lock for are folios it will not revoke when a remote node
-	 * writes them.
+	 * No grant is asked for here either: this runs from inside
+	 * ->readahead with the window it just sent still locked.  What the
+	 * read's grant does not reach fuse_send_readpages() declines, and
+	 * the pages go back unfilled.
 	 */
-	if (fc->writeback_cache && fc->dlm) {
-		int err = fuse_get_dlm_lock(file, (loff_t)start << PAGE_SHIFT,
-					    (size_t)nr << PAGE_SHIFT,
-					    FUSE_PAGE_LOCK_READ);
-
-		if (err < 0 && err != -ENOSYS)
-			return;
-	}
-
 	ia = fuse_io_alloc(NULL, nr);
 	if (!ia)
 		return;
@@ -1495,46 +1487,21 @@ static void fuse_readahead(struct readahead_control *rac)
 	}
 
 	/*
-	 * Readahead fills the page cache past the range the reader locked,
-	 * so take a DLM read grant over the whole window here too.  Folios
+	 * Readahead fills the page cache past the range the reader asked
+	 * for, and what lands there has to be covered by a grant: folios
 	 * the server handed out no lock for are folios it will not revoke
 	 * when a remote node writes them, and a later read would be served
-	 * from stale cache.  Take the grant before any folio is pulled off
-	 * @rac, so the window that gets populated is the window that is
-	 * covered.
+	 * from stale cache.
 	 *
-	 * The grant is only asked for here.  Confirming it and holding it
-	 * against a revoke is fuse_send_readpages(), one run of pages at a
-	 * time, since that is where the request the reply fills them from
-	 * goes out; a run it declines ends the window.
+	 * No grant is asked for here.  ->readahead is entered with every
+	 * page of the window already locked, and none may be asked for
+	 * under a page lock; the read this window belongs to took one over
+	 * it in fuse_read_grant(), before the page cache was entered.
 	 *
-	 * The grant covers the window this call intends rather than the one
-	 * it ends up with, since the folios past what mm built are not
-	 * allocated yet.  readahead_expand() stops at the first folio already
-	 * cached, so a short realisation leaves the tail covered but not
-	 * populated.  That is the harmless direction: coverage without cached
-	 * data serves nothing stale, and a folio already cached is one an
-	 * earlier grant already covers.
-	 *
-	 * Speculative pages are not worth serving uncovered: on a failed
-	 * request drop the window and let read_pages() clean up the folios
-	 * left in @rac.  A server without DLM support answers -ENOSYS and
-	 * clears fc->dlm, which is not a failure.
-	 *
-	 * The round trip is taken before any folio of the window is locked
-	 * and with nothing fenced out, so it holds up this reader and
-	 * nothing else.
+	 * What that left uncovered fuse_send_readpages() declines, one run
+	 * of pages at a time, and those pages go back unfilled for
+	 * fuse_read_folio() to fetch with no page held.
 	 */
-	if (fc->writeback_cache && fc->dlm) {
-		size_t len = (size_t)(target_end - readahead_index(rac))
-				<< PAGE_SHIFT;
-		int err = fuse_get_dlm_lock(rac->file, readahead_pos(rac), len,
-					    FUSE_PAGE_LOCK_READ);
-
-		if (err < 0 && err != -ENOSYS)
-			return;
-	}
-
 	for (;;) {
 		struct fuse_io_args *ia;
 		struct fuse_args_pages *ap;
