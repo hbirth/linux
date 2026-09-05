@@ -1063,20 +1063,100 @@ static int fuse_do_readpage(struct file *file, struct page *page)
 	return 0;
 }
 
+/**
+ * fuse_read_folio_retry - back off a fill with no grant to run under
+ * @file: file to read through
+ * @folio: the folio handed over locked, unlocked here
+ * @pos: byte offset of @folio
+ * @len: its size in bytes
+ *
+ * Neither reason a fill is refused can be dealt with while the folio is
+ * held: waiting a revoke out would hold the page cache that revoke is
+ * about to drop, and no grant may be asked for under a page lock at all
+ * (Documentation/filesystems/fuse/fuse-AOP_TRUNCATED_PAGE-reason.txt).
+ * Unlock, do both, and send the caller round again to find the range
+ * covered.
+ *
+ * Return: AOP_TRUNCATED_PAGE, or a negative error.
+ */
+static int fuse_read_folio_retry(struct file *file, struct folio *folio,
+				 loff_t pos, size_t len)
+{
+	struct fuse_inode *fi = get_fuse_inode(file_inode(file));
+	struct fuse_dlm_span pin;
+	int err;
+
+	folio_unlock(folio);
+
+	/* Wait the revoke out; what it leaves behind is asked for below */
+	fuse_dlm_pin(fi, &pin, pos, len);
+	fuse_dlm_unpin(fi);
+
+	err = fuse_get_dlm_lock(file, pos, len, FUSE_PAGE_LOCK_READ);
+	if (err == -ENOSYS)
+		return AOP_TRUNCATED_PAGE;
+	if (err < 0)
+		return err;
+	/*
+	 * Granted but unrecorded, so the retry finds the range uncovered
+	 * and comes straight back here.  Report it rather than spin.
+	 */
+	if (err > 0)
+		return -ENOMEM;
+
+	return AOP_TRUNCATED_PAGE;
+}
+
 static int fuse_read_folio(struct file *file, struct folio *folio)
 {
 	struct page *page = &folio->page;
 	struct inode *inode = page->mapping->host;
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	loff_t pos = folio_pos(folio);
+	size_t len = folio_size(folio);
+	struct fuse_dlm_span pin;
+	bool pinned = false;
 	int err;
 
 	err = -EIO;
 	if (fuse_is_bad(inode))
 		goto out;
 
+	/*
+	 * The grant the folio is filled under, held from the confirmation
+	 * until the bytes are in the page cache.  What lands here is served
+	 * to every later reader of the file, so it must neither be fetched
+	 * under a grant a revoke has taken away nor be dropped into a range
+	 * a revoke has just swept: such a folio is uptodate and covered by
+	 * nothing, and no further notify comes for a lock this client no
+	 * longer holds.
+	 *
+	 * The pin closes the second, since a revoke over the folio waits
+	 * for the fill and drops the folio after it; the confirmation
+	 * closes the first.  Both fail into fuse_read_folio_retry().
+	 */
+	if (fc->dlm && fc->writeback_cache) {
+		pinned = fuse_dlm_trypin(fi, &pin, pos, len);
+		if (pinned && !fuse_dlm_lock_is_held(fi, pos, len,
+						     FUSE_PAGE_LOCK_READ)) {
+			fuse_dlm_unpin(fi);
+			pinned = false;
+		}
+		if (!pinned)
+			return fuse_read_folio_retry(file, folio, pos, len);
+	}
+
 	err = fuse_do_readpage(file, page);
 	fuse_invalidate_atime(inode);
  out:
 	unlock_page(page);
+	/*
+	 * After the unlock, so a revoke draining this pin finds the folio
+	 * it has to drop unlocked and takes it out.
+	 */
+	if (pinned)
+		fuse_dlm_unpin(fi);
 	return err;
 }
 
