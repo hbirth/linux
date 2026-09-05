@@ -390,6 +390,7 @@ static void fuse_truncate_update_attr(struct inode *inode, struct file *file)
 	spin_lock(&fi->lock);
 	fi->attr_version = atomic64_inc_return(&fc->attr_version);
 	i_size_write(inode, 0);
+	fuse_writeback_crop_truncated(inode, 0);
 	spin_unlock(&fi->lock);
 	file_update_time(file);
 	fuse_invalidate_attr_mask(inode, FUSE_STATX_MODSIZE);
@@ -3179,9 +3180,40 @@ __releases(fi->lock)
 __acquires(fi->lock)
 {
 	struct fuse_mount *fm = get_fuse_mount(inode);
+	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	loff_t crop = i_size_read(inode);
 	struct fuse_writepage_args *wpa;
+
+	/*
+	 * fuse_send_writepage() crops a queued request to the size passed
+	 * here and ends the writeback on everything past it without ever
+	 * sending it -- the folios come back clean with their bytes gone
+	 * and nothing reports an error, so a later fsync() succeeds over
+	 * the hole.  That is right after a truncate, where those bytes are
+	 * meant to disappear, and it is silent data loss for any other
+	 * shrink.
+	 *
+	 * Upstream there is no other shrink on a writeback mount:
+	 * fuse_get_cache_mask() keeps STATX_SIZE, so i_size never takes
+	 * the server's answer and only a truncate lowers it, under
+	 * fuse_set_nowrite().  With DLM the server's size is applied
+	 * (fuse_attr_cache_mask()), and a reply that is merely behind the
+	 * local writers -- the normal state of a shared file being written
+	 * -- would crop gigabytes of queued data away.
+	 *
+	 * So crop against the high water mark, which a truncate moves back
+	 * down (fuse_writeback_crop_truncated(), called under the freeze)
+	 * and which follows i_size again as soon as no request is left to
+	 * protect (fuse_writepage_end()).  In the steady state it is
+	 * i_size, including the partial folio at EOF that the crop exists
+	 * to clip.
+	 */
+	if (fc->writeback_cache) {
+		if (crop > fi->wb_crop)
+			fi->wb_crop = crop;
+		crop = fi->wb_crop;
+	}
 
 	while (fi->writectr >= 0 && !list_empty(&fi->queued_writes)) {
 		wpa = list_entry(fi->queued_writes.next,
@@ -3212,6 +3244,17 @@ static void fuse_writepage_end(struct fuse_mount *fm, struct fuse_args *args,
 	spin_lock(&fi->lock);
 	fi->writectr--;
 	fuse_writepage_finish(wpa);
+	/*
+	 * Nothing sent and nothing queued: the crop has no request left to
+	 * protect, so let it follow i_size again rather than stay at a
+	 * high water mark this inode may never reach a second time -- a
+	 * file shrunk by another node and written again would otherwise
+	 * have its last folio sent whole instead of clipped at EOF.  See
+	 * fuse_flush_writepages().
+	 */
+	if (fc->writeback_cache && fi->writectr == 0 &&
+	    list_empty(&fi->queued_writes))
+		fi->wb_crop = i_size_read(inode);
 	spin_unlock(&fi->lock);
 	fuse_writepage_free(wpa);
 }
@@ -4979,6 +5022,7 @@ void fuse_init_file_inode(struct inode *inode, unsigned int flags)
 	fi->write_stream_next = 0;
 	fi->write_stream_start = 0;
 	atomic_set(&fi->size_extenders, 0);
+	fi->wb_crop = 0;
 
 	if (IS_ENABLED(CONFIG_FUSE_DAX))
 		fuse_dax_inode_init(inode, flags);
