@@ -342,8 +342,7 @@ int fuse_finish_open(struct inode *inode, struct file *file)
 }
 
 /*
- * Drop the page cache an open that did not get FOPEN_KEEP_CACHE must not keep,
- * and report whether the mapping came out empty.
+ * Drop the page cache an open that did not get FOPEN_KEEP_CACHE must not keep.
  *
  * Serialised on the mapping's invalidate lock.  Every opener runs this same
  * full-mapping walk and invalidate_inode_pages2_range() takes each folio's
@@ -354,13 +353,10 @@ int fuse_finish_open(struct inode *inode, struct file *file)
  * mapping and the rest fall straight back out of mapping_empty().
  *
  * Holding it exclusive also fences faults for the duration, which is what
- * truncate already does across this same walk, and it keeps the emptiness
- * test from reading a mapping another opener is halfway through.
+ * truncate already does across this same walk.
  */
-bool fuse_open_drop_cache(struct inode *inode)
+void fuse_open_drop_cache(struct inode *inode)
 {
-	bool emptied;
-
 	filemap_invalidate_lock(inode->i_mapping);
 	/*
 	 * Write back first: the drop launders whatever it finds dirty a
@@ -369,10 +365,7 @@ bool fuse_open_drop_cache(struct inode *inode)
 	 */
 	filemap_write_and_wait(inode->i_mapping);
 	invalidate_inode_pages2(inode->i_mapping);
-	emptied = !filemap_range_has_page(inode->i_mapping, 0, LLONG_MAX);
 	filemap_invalidate_unlock(inode->i_mapping);
-
-	return emptied;
 }
 
 static void fuse_truncate_update_attr(struct inode *inode, struct file *file)
@@ -444,18 +437,7 @@ static int fuse_open(struct inode *inode, struct file *file)
 				fuse_dlm_cache_release_locks(fi);
 			truncate_pagecache(inode, 0);
 		} else if (!(ff->open_flags & FOPEN_KEEP_CACHE)) {
-			/*
-			 * Only when the drop really emptied the mapping; a
-			 * folio that survived still needs its record.  This
-			 * open holds no lock against buffered IO, which can
-			 * repopulate the mapping once the invalidate lock is
-			 * dropped -- but such a folio is populated after the
-			 * drop and keeps its page, so a later reader finds
-			 * both the page and the record it needs.
-			 */
-			if (fuse_open_drop_cache(inode) &&
-			    fc->dlm && fc->writeback_cache)
-				fuse_dlm_ranges_dropped(fi, 0, U64_MAX);
+			fuse_open_drop_cache(inode);
 		}
 	}
 	if (dax_truncate)
@@ -4241,28 +4223,8 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
 			file_update_time(file);
 	}
 
-	if (mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE)) {
+	if (mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE))
 		truncate_pagecache_range(inode, offset, offset + length - 1);
-
-		/*
-		 * The whole pages inside the hole are gone, so a revoked
-		 * range over them has nothing left to make writeback take
-		 * the grant again for, and would sit in the tree unfreed.
-		 * The pages straddling the ends survive with their punched
-		 * part zeroed, so their record still names real (now zero)
-		 * bytes and stays.  Only when the drop really emptied the
-		 * span: a busy folio that survived keeps its record.
-		 */
-		if (fm->fc->dlm && fm->fc->writeback_cache) {
-			uint64_t first = PAGE_ALIGN(offset);
-			uint64_t last = (uint64_t)(offset + length) & PAGE_MASK;
-
-			if (first < last &&
-			    !filemap_range_has_page(inode->i_mapping, first,
-						    last - 1))
-				fuse_dlm_ranges_dropped(fi, first, last - 1);
-		}
-	}
 
 	fuse_invalidate_attr_mask(inode, FUSE_STATX_MODSIZE);
 
@@ -4367,24 +4329,9 @@ static ssize_t __fuse_copy_file_range(struct file *file_in, loff_t pos_in,
 	if (err)
 		goto out;
 
-	{
-		loff_t lstart = ALIGN_DOWN(pos_out, PAGE_SIZE);
-		loff_t lend = ALIGN(pos_out + outarg.size, PAGE_SIZE) - 1;
-
-		truncate_inode_pages_range(inode_out->i_mapping, lstart, lend);
-
-		/*
-		 * The record over the dropped span has nothing left to
-		 * describe, and left DIRTY it would make the next partial
-		 * write there keep and flush folio bytes nobody wrote.
-		 * Only when the drop really emptied it: a folio a
-		 * concurrent fault put back keeps its record.
-		 */
-		if (fc->dlm && fc->writeback_cache &&
-		    !filemap_range_has_page(inode_out->i_mapping, lstart,
-					    lend))
-			fuse_dlm_ranges_dropped(fi_out, lstart, lend);
-	}
+	truncate_inode_pages_range(inode_out->i_mapping,
+				   ALIGN_DOWN(pos_out, PAGE_SIZE),
+				   ALIGN(pos_out + outarg.size, PAGE_SIZE) - 1);
 
 	file_update_time(file_out);
 	fuse_write_update_attr(inode_out, pos_out + outarg.size, outarg.size);

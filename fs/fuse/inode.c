@@ -498,14 +498,14 @@ u32 fuse_get_cache_mask(struct inode *inode)
  * for exactly what the grant covers:
  *
  *  - size, when the server reports less than i_size and the tail it does not
- *    know about, [srv_size, i_size), is entirely under a write grant.  Taking
- *    the server's answer would shrink i_size and have truncate_pagecache()
- *    throw the unwritten tail away.
- *  - mtime and ctime, while a write grant covers unwritten data: our writes
- *    have stamped them locally and the server's stamps predate them.  Only
- *    while the cache is actually dirty, not for as long as the grant lives:
- *    a grant is held until it is revoked or the inode is evicted, and past
- *    the writeback the server's stamps are the newer ones.  Keeping ours
+ *    know about, [attr->size, i_size), is entirely under a write grant.
+ *    Taking the server's answer would shrink i_size and have
+ *    truncate_pagecache() throw the unwritten tail away.
+ *  - mtime and ctime, while the page cache is dirty or under writeback: our
+ *    writes have stamped them locally and the server's stamps predate them.
+ *    Only while the cache is actually dirty, not for as long as a grant
+ *    lives: a grant is held until it is revoked or the inode is evicted, and
+ *    past the writeback the server's stamps are the newer ones.  Keeping ours
  *    beyond that would hide a remote chown or chmod indefinitely.
  *
  * A remote truncate cannot slip through.  It has to revoke the grant first,
@@ -536,11 +536,6 @@ static u32 fuse_attr_cache_mask(struct inode *inode, struct fuse_attr *attr,
 	 * the tail grants itself while cached writes above the new size
 	 * are still waiting for writeback.
 	 */
-	if (!fuse_dlm_write_grant_exists(fi) &&
-	    !mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) &&
-	    !mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK))
-		return cache_mask;
-
 	if (mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) ||
 	    mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK))
 		cache_mask |= STATX_MTIME | STATX_CTIME;
@@ -646,27 +641,6 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 
 		if (inval)
 			invalidate_inode_pages2(inode->i_mapping);
-
-		/*
-		 * The DLM record has to follow the cache out, as on every
-		 * other path that drops it.  A revoked range exists only to
-		 * make writeback take the grant again before sending the
-		 * folios under it, so once they are gone it describes
-		 * nothing and would sit in the tree unfreed.  The pages above
-		 * the new size are gone unconditionally; the rest only when
-		 * the invalidate really emptied the mapping, so a folio that
-		 * survived (or was faulted back) keeps its record.
-		 */
-		if (fc->dlm && fc->writeback_cache) {
-			if (have_size && oldsize != attr->size)
-				fuse_dlm_ranges_dropped(fi,
-							PAGE_ALIGN(attr->size),
-							U64_MAX);
-			if (inval &&
-			    !filemap_range_has_page(inode->i_mapping, 0,
-						    LLONG_MAX))
-				fuse_dlm_ranges_dropped(fi, 0, U64_MAX);
-		}
 	}
 
 	if (IS_ENABLED(CONFIG_FUSE_DAX))
@@ -968,8 +942,6 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 {
 	struct fuse_inode *fi;
 	struct inode *inode;
-	uint64_t pg_first;
-	uint64_t pg_last;
 	loff_t end_byte;
 	pgoff_t pg_start;
 	pgoff_t pg_end;
@@ -1014,17 +986,8 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 		else
 			pg_end = (offset + len - 1) >> PAGE_SHIFT;
 
-		/*
-		 * Byte bounds of the same region, and the page aligned form
-		 * the DLM record is told about.  A grant is recorded page
-		 * aligned, so the range handed to it has to cover whole
-		 * pages or the record would keep a range the page cache no
-		 * longer backs.
-		 */
+		/* Byte bounds of the same region */
 		end_byte = len <= 0 ? LLONG_MAX : offset + len - 1;
-		pg_first = (uint64_t)offset & PAGE_MASK;
-		pg_last = len <= 0 ? U64_MAX :
-			  (((uint64_t)offset + len - 1) | (PAGE_SIZE - 1));
 
 		/*
 		 * A data invalidation means another (remote) entity is modifying
@@ -1137,18 +1100,6 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 				fuse_notify_invalidate_range(inode, pg_start,
 							     pg_end,
 							     may_be_dirty);
-
-			/*
-			 * A revoked range exists to describe page cache
-			 * dirtied before the grant went; with that cache gone
-			 * it has nothing left to say.  Only when it really
-			 * went: an invalidate can leave a busy folio behind,
-			 * and that folio still needs its record.
-			 */
-			if (has_pages &&
-			    !filemap_range_has_page(inode->i_mapping, offset,
-						    end_byte))
-				fuse_dlm_ranges_dropped(fi, pg_first, pg_last);
 
 			if (latched)
 				pr_info_ratelimited("FUSE: inode %llu latched to direct IO on invalidation notify storm\n",
