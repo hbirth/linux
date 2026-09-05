@@ -3062,8 +3062,22 @@ static int fuse_writepage_locked(struct folio *folio)
 
 	/*
 	 * Hold the range again before sending it; see fuse_writepages_fill().
+	 *
+	 * folio_unmap_invalidate() holds the folio locked here, so a grant
+	 * this folio does not already hold must not be asked for and there is
+	 * no later pass of this submit to defer it to.  Leave the folio dirty
+	 * and report no error: the invalidate that laundered it then finds it
+	 * busy, and an ordinary writeback sends it with a grant of its own.
 	 */
 	if (fc->dlm && fc->writeback_cache) {
+		if (!fuse_dlm_lock_is_held(fi, folio_pos(folio),
+					   folio_size(folio),
+					   FUSE_PAGE_LOCK_WRITE)) {
+			fuse_file_put(ff, false);
+			fuse_writeback_redirty(fc, NULL, folio);
+			return 0;
+		}
+
 		error = fuse_dlm_regrant_range(ff, inode, folio_pos(folio),
 					       folio_pos(folio) +
 					       folio_size(folio) - 1);
@@ -3104,11 +3118,25 @@ err:
 	return error;
 }
 
+/*
+ * How many times a data integrity writeback goes round for folios it had to
+ * skip.  Each pass takes the grants the one before it deferred, so one more
+ * is normally enough; the cap is there because a revoke can take them again.
+ */
+#define FUSE_WB_DEFER_PASSES 4
+
 struct fuse_fill_wb_data {
 	struct fuse_writepage_args *wpa;
 	struct fuse_file *ff;
 	struct inode *inode;
 	unsigned int max_pages;
+	/*
+	 * The folios this pass could not send because their grant had gone.
+	 * Taken back in fuse_writepages(), where no folio is held, for the
+	 * pass that follows; see fuse_writepages_fill().
+	 */
+	u64 regrant_start;
+	u64 regrant_end;
 };
 
 static bool fuse_pages_realloc(struct fuse_fill_wb_data *data)
@@ -3232,31 +3260,50 @@ static int fuse_writepages_fill(struct folio *folio,
 	 * -ENOSYS, which is not a failure.
 	 */
 	if (fc->dlm && fc->writeback_cache) {
+		loff_t pos = folio_pos(folio);
+		size_t len = folio_size(folio);
+
 		/*
-		 * Driven by a NOTIFY invalidate.  A grant this folio does not
-		 * already hold would have to be asked for from inside the
-		 * handler the server is waiting on, for the range that
-		 * handler is revoking, with the folio locked and under
-		 * writeback.  The server cannot answer that until the revoke
-		 * completes, and the revoke cannot complete until this
-		 * returns.
+		 * The folio is locked here, and the folios queued before it
+		 * in this pass are under writeback, so a grant this folio
+		 * does not already hold must not be asked for:
+		 * Documentation/filesystems/fuse/fuse-AOP_TRUNCATED_PAGE-
+		 * reason.txt states the rule the read path is built around,
+		 * that no cluster lock may be taken while a page lock is
+		 * held.  fuse_do_readpage() has AOP_TRUNCATED_PAGE to unlock
+		 * and retry with; ->writepage has nothing of the sort.
 		 *
-		 * Leave the folio dirty instead.  An ordinary writeback sends
-		 * it with a grant of its own; nothing is lost and no error is
-		 * recorded for a later fsync to report.
+		 * Skip the folio instead.  It goes back on the dirty list,
+		 * the range is remembered for fuse_writepages() to take back
+		 * with no folio held, and the pass that follows sends it.
+		 * Nothing is lost and no error is recorded for a later fsync
+		 * to report.
 		 */
-		if (fuse_in_notify_ctx() &&
-		    !fuse_dlm_lock_is_held(fi, folio_pos(folio),
-					   folio_size(folio),
+		if (!fuse_dlm_lock_is_held(fi, pos, len,
 					   FUSE_PAGE_LOCK_WRITE)) {
 			fuse_writeback_redirty(fc, wbc, folio);
+			if (data->regrant_end <= data->regrant_start) {
+				data->regrant_start = pos;
+				data->regrant_end = pos + len;
+			} else {
+				data->regrant_start = min_t(u64,
+							    data->regrant_start,
+							    pos);
+				data->regrant_end = max_t(u64,
+							  data->regrant_end,
+							  pos + len);
+			}
 			err = 0;
 			goto out_unlock;
 		}
 
-		err = fuse_dlm_regrant_range(data->ff, inode, folio_pos(folio),
-					     folio_pos(folio) +
-					     folio_size(folio) - 1);
+		/*
+		 * Held: this walks the record and sends nothing.  It stays a
+		 * call rather than the check above so a grant that arrives
+		 * between them is still used.
+		 */
+		err = fuse_dlm_regrant_range(data->ff, inode, pos,
+					     pos + len - 1);
 		if (err < 0 && err != -ENOSYS) {
 			fuse_writeback_redirty(fc, wbc, folio);
 			goto out_unlock;
@@ -3303,7 +3350,7 @@ static int fuse_writepages(struct address_space *mapping,
 {
 	struct inode *inode = mapping->host;
 	struct fuse_conn *fc = get_fuse_conn(inode);
-	struct fuse_fill_wb_data data;
+	unsigned int tries = FUSE_WB_DEFER_PASSES;
 	int err;
 
 	err = -EIO;
@@ -3314,17 +3361,49 @@ static int fuse_writepages(struct address_space *mapping,
 	    fc->num_background >= fc->congestion_threshold)
 		return 0;
 
-	data.inode = inode;
-	data.wpa = NULL;
-	data.ff = NULL;
+	/*
+	 * A folio whose grant had gone is skipped and its range taken back
+	 * below, which leaves the folio dirty for a later pass.  For a data
+	 * integrity writeback there is no later pass: fsync() and close()
+	 * would report the bytes written while they are still only in the
+	 * page cache.  Go round again, now that the grant is held, until
+	 * nothing is left deferred.
+	 */
+	do {
+		struct fuse_fill_wb_data data = { .inode = inode };
+		bool regranted = false;
 
-	err = write_cache_pages(mapping, wbc, fuse_writepages_fill, &data);
-	if (data.wpa) {
-		WARN_ON(!data.wpa->ia.ap.num_pages);
-		fuse_writepages_send(&data);
-	}
-	if (data.ff)
-		fuse_file_put(data.ff, false);
+		err = write_cache_pages(mapping, wbc, fuse_writepages_fill,
+					&data);
+		if (data.wpa) {
+			WARN_ON(!data.wpa->ia.ap.num_pages);
+			fuse_writepages_send(&data);
+		}
+
+		/*
+		 * Take back what the folios above had to skip, so the pass
+		 * that follows finds the grant and sends the folios they left
+		 * dirty.  With no folio held, which is the whole point.
+		 *
+		 * Not from a revoke handler: it would ask for the very range
+		 * it is revoking, so the folios it skipped stay dirty for an
+		 * ordinary writeback, and every pass here would skip them
+		 * again.
+		 */
+		if (data.ff && data.regrant_end > data.regrant_start &&
+		    !fuse_in_notify_ctx()) {
+			fuse_dlm_regrant_range(data.ff, inode,
+					       data.regrant_start,
+					       data.regrant_end - 1);
+			regranted = true;
+		}
+
+		if (data.ff)
+			fuse_file_put(data.ff, false);
+
+		if (err || wbc->sync_mode != WB_SYNC_ALL || !regranted)
+			break;
+	} while (--tries);
 
 out:
 	return err;
