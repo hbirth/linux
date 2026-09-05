@@ -3286,12 +3286,22 @@ static int fuse_writepages_fill(struct folio *folio,
 				data->regrant_start = pos;
 				data->regrant_end = pos + len;
 			} else {
-				data->regrant_start = min_t(u64,
-							    data->regrant_start,
-							    pos);
-				data->regrant_end = max_t(u64,
-							  data->regrant_end,
-							  pos + len);
+				u64 st = min_t(u64, data->regrant_start, pos);
+				u64 en = max_t(u64, data->regrant_end,
+					       pos + len);
+
+				/*
+				 * One shard is as far as a single request is
+				 * worth taking back.  A pass sweeping a large
+				 * file skips folios a long way apart, and the
+				 * span between them says nothing about what
+				 * is wanted; the folios left out stay dirty
+				 * and a later pass asks for them.
+				 */
+				if (en - st <= FUSE_DLM_SHARD_SIZE) {
+					data->regrant_start = st;
+					data->regrant_end = en;
+				}
 			}
 			err = 0;
 			goto out_unlock;
