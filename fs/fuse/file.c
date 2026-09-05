@@ -1607,8 +1607,13 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 			return err;
 	}
 
-	/* The grant this read and the readahead behind it fill under */
-	fuse_read_grant(file, iocb->ki_pos, iov_iter_count(to));
+	/*
+	 * The grant this read and the readahead behind it fill under.  Not
+	 * for O_DIRECT, which takes no DLM lock at all: it fills no page
+	 * cache, and what it reads is the server's to order.
+	 */
+	if (!(iocb->ki_flags & IOCB_DIRECT))
+		fuse_read_grant(file, iocb->ki_pos, iov_iter_count(to));
 
 	/*
 	 * A NOTIFY invalidate racing this read drops the folios it
@@ -2433,8 +2438,14 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		 * Only the append case must wait for the lock: its range
 		 * depends on i_size, which is stable only under the exclusive
 		 * inode lock.
+		 *
+		 * O_DIRECT takes no DLM lock at all, here or anywhere: it
+		 * dirties no page cache, so there is nothing for a grant to
+		 * cover, and its bytes are the server's to order against the
+		 * rest of the cluster.
 		 */
-		if (fc->dlm && !(iocb->ki_flags & IOCB_APPEND)) {
+		if (fc->dlm && !(iocb->ki_flags & IOCB_DIRECT) &&
+		    !(iocb->ki_flags & IOCB_APPEND)) {
 			dlm_pos = iocb->ki_pos;
 			dlm_len = iov_iter_count(from);
 
@@ -2470,7 +2481,8 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 		/* note that this small code dup will save us a lot of headache later
 		 * when appends are done concurrently without using parallel direct writes */
-		if (fc->dlm && (iocb->ki_flags & IOCB_APPEND)) {
+		if (fc->dlm && !(iocb->ki_flags & IOCB_DIRECT) &&
+		    (iocb->ki_flags & IOCB_APPEND)) {
 			/*
 			 * An append write lands at the current EOF no matter
 			 * what ki_pos holds: generic_write_checks() rewrites
@@ -2495,7 +2507,8 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		 * generic_write_checks() may have put ki_pos past the granted
 		 * range.  Re-lock where the write really lands.
 		 */
-		if (fc->dlm && (iocb->ki_flags & IOCB_APPEND) &&
+		if (fc->dlm && !(iocb->ki_flags & IOCB_DIRECT) &&
+		    (iocb->ki_flags & IOCB_APPEND) &&
 		    iocb->ki_pos != dlm_pos) {
 			dlm_pos = iocb->ki_pos;
 			dlm_len = iov_iter_count(from);
