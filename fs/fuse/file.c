@@ -1064,6 +1064,27 @@ static int fuse_do_readpage(struct file *file, struct page *page)
 	return 0;
 }
 
+/*
+ * The unit the readahead window is built in: one request's worth of pages,
+ * never more than the readahead this fd was allowed.  @ra is NULL where
+ * there is no per-fd state to bound it by.
+ *
+ * fuse_readahead() rounds its window up to this and fuse_readahead_lookahead()
+ * puts one more of them past it, so fuse_read_grant() sizes the grant from it
+ * as well and the two stay in step.
+ */
+static unsigned int fuse_readahead_unit(struct fuse_conn *fc,
+					struct file_ra_state *ra)
+{
+	unsigned int max_pages = min_t(unsigned int, fc->max_pages,
+				       fc->max_read / PAGE_SIZE);
+
+	if (!ra)
+		return max_pages;
+
+	return min_t(unsigned int, max_pages, ra->ra_pages);
+}
+
 /**
  * fuse_read_grant - take the grant a page cache fill runs under
  * @file: file to read through
@@ -1088,12 +1109,23 @@ static int fuse_read_grant(struct file *file, loff_t pos, size_t count)
 {
 	struct inode *inode = file_inode(file);
 	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct file_ra_state *ra = &file->f_ra;
 	loff_t size = i_size_read(inode);
-	loff_t ahead = (loff_t)file->f_ra.ra_pages << PAGE_SHIFT;
 	loff_t end = pos + count;
+	unsigned int unit;
+	loff_t ahead;
 
 	if (!fc->writeback_cache || !fc->dlm)
 		return 0;
+
+	/*
+	 * What readahead may fill past the read: the window mm builds, at
+	 * most ra_pages wide, plus what this filesystem adds to it -- the
+	 * round up to a whole request, under one unit, and the one request
+	 * fuse_readahead_lookahead() puts past that.
+	 */
+	unit = fuse_readahead_unit(fc, ra);
+	ahead = (loff_t)(ra->ra_pages + 2 * unit) << PAGE_SHIFT;
 
 	if (end < size)
 		end += min(ahead, size - end);
@@ -1477,12 +1509,11 @@ static void fuse_readahead(struct readahead_control *rac)
 	 * negotiated large requests does not get to prefetch beyond the
 	 * window the admin allowed.
 	 */
-	unit = max_pages;
+	unit = fuse_readahead_unit(fc, rac->ra);
 	target_end = readahead_index(rac) + readahead_count(rac);
 	if (rac->ra) {
 		unsigned int nr = readahead_count(rac);
 
-		unit = min_t(unsigned int, max_pages, rac->ra->ra_pages);
 		if (unit > 1 && nr % unit)
 			target_end = readahead_index(rac) + roundup(nr, unit);
 	}
