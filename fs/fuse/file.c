@@ -3021,6 +3021,30 @@ static struct fuse_writepage_args *fuse_writepage_args_setup(struct folio *folio
 	return wpa;
 }
 
+/*
+ * Put a folio writeback could not send back on the dirty list.
+ *
+ * write_cache_pages() takes the dirty flag off a folio before it calls
+ * here, and fuse_launder_folio() does the same for the submit it makes
+ * itself, so a folio that comes back unsent has thrown its bytes away
+ * unless they are put back.  @wbc is NULL for the launder.
+ *
+ * Only while there is a connection left to take the bytes.  After an abort
+ * every send fails, and a folio redirtied for a retry that can no longer
+ * happen would keep sync() going forever.
+ */
+static void fuse_writeback_redirty(struct fuse_conn *fc,
+				   struct writeback_control *wbc,
+				   struct folio *folio)
+{
+	if (!READ_ONCE(fc->connected))
+		return;
+
+	folio_mark_dirty(folio);
+	if (wbc)
+		wbc->pages_skipped += folio_nr_pages(folio);
+}
+
 static int fuse_writepage_locked(struct folio *folio)
 {
 	struct address_space *mapping = folio->mapping;
@@ -3075,7 +3099,7 @@ err:
 	 * that laundered it then reports the folio busy, as it does for any
 	 * folio it cannot free.
 	 */
-	filemap_dirty_folio(mapping, folio);
+	fuse_writeback_redirty(fc, NULL, folio);
 	mapping_set_error(mapping, error);
 	return error;
 }
@@ -3186,7 +3210,7 @@ static int fuse_writepages_fill(struct folio *folio,
 			 * flag off before calling here, so put it back
 			 * rather than drop a write fsync reported done.
 			 */
-			folio_redirty_for_writepage(wbc, folio);
+			fuse_writeback_redirty(fc, wbc, folio);
 			goto out_unlock;
 		}
 	}
@@ -3225,7 +3249,7 @@ static int fuse_writepages_fill(struct folio *folio,
 		    !fuse_dlm_lock_is_held(fi, folio_pos(folio),
 					   folio_size(folio),
 					   FUSE_PAGE_LOCK_WRITE)) {
-			folio_redirty_for_writepage(wbc, folio);
+			fuse_writeback_redirty(fc, wbc, folio);
 			err = 0;
 			goto out_unlock;
 		}
@@ -3234,7 +3258,7 @@ static int fuse_writepages_fill(struct folio *folio,
 					     folio_pos(folio) +
 					     folio_size(folio) - 1);
 		if (err < 0 && err != -ENOSYS) {
-			folio_redirty_for_writepage(wbc, folio);
+			fuse_writeback_redirty(fc, wbc, folio);
 			goto out_unlock;
 		}
 		err = 0;
@@ -3249,7 +3273,7 @@ static int fuse_writepages_fill(struct folio *folio,
 		err = -ENOMEM;
 		wpa = fuse_writepage_args_setup(folio, data->ff);
 		if (!wpa) {
-			folio_redirty_for_writepage(wbc, folio);
+			fuse_writeback_redirty(fc, wbc, folio);
 			goto out_unlock;
 		}
 		fuse_file_get(wpa->ia.ff);
