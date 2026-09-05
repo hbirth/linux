@@ -652,7 +652,34 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 
 		if (have_size && oldsize != attr->size) {
 			truncate_pagecache(inode, attr->size);
-			if (!fc->explicit_inval_data)
+			/*
+			 * A size that differs from the cached one is
+			 * upstream's evidence that another client wrote
+			 * the file, and the data cache is dropped on the
+			 * strength of it.  Under DLM that evidence is
+			 * redundant: a remote write cannot land without
+			 * revoking the grant covering it, and the revoke
+			 * invalidates the range on its way through
+			 * (fuse_reverse_inval_inode()).  Coherency is the
+			 * grant's job here, not the size delta's.
+			 *
+			 * It is also not affordable.  A shared file reaches
+			 * this on every write: another node extends it, the
+			 * GETATTR that fuse_cache_write_iter() takes for
+			 * STATX_MODE returns the larger size, and
+			 * fuse_attr_cache_mask() holds STATX_SIZE only for
+			 * the opposite direction -- a local size ahead of
+			 * the server's.  So a write that wanted the mode
+			 * bits invalidates the whole mapping, and on a
+			 * writeback mapping that is a laundering pass, not
+			 * a drop: every dirty folio in the file goes out
+			 * one FUSE_WRITE at a time, with the writer parked
+			 * behind all of it.
+			 *
+			 * The size itself is still taken below.  Only the
+			 * data cache is kept.
+			 */
+			if (!fc->explicit_inval_data && !fc->dlm)
 				inval = true;
 		} else if (have_mtime && fc->auto_inval_data) {
 			struct timespec64 new_mtime = {
