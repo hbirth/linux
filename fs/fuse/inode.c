@@ -584,6 +584,10 @@ static u32 fuse_attr_cache_mask(struct inode *inode, struct fuse_attr *attr,
 	return cache_mask;
 }
 
+/* Defined below, next to the NOTIFY paths that are its other caller. */
+static void fuse_invalidate_mapping_range(struct inode *inode, pgoff_t start,
+					  pgoff_t end, bool may_be_dirty);
+
 static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr,
 				     struct fuse_statx *sx, u64 attr_valid,
 				     u64 attr_version, u64 evict_ctr)
@@ -664,8 +668,16 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 				inval = true;
 		}
 
+		/*
+		 * Through the helper rather than invalidate_inode_pages2():
+		 * it writes the range back in batched writeback first, where
+		 * the bare invalidate would launder it a folio per round
+		 * trip, and it substitutes a plain drop while writepages are
+		 * frozen, where laundering would wait for a reply that
+		 * fuse_flush_writepages() is holding back.
+		 */
 		if (inval)
-			invalidate_inode_pages2(inode->i_mapping);
+			fuse_invalidate_mapping_range(inode, 0, -1, true);
 	}
 
 	if (IS_ENABLED(CONFIG_FUSE_DAX))
@@ -933,8 +945,8 @@ static void fuse_dlm_revoke_inval_range(struct fuse_inode *fi, loff_t offset,
  * fuse_do_setattr() invalidates the mapping after releasing the freeze, the
  * O_TRUNC open path calls truncate_pagecache().
  */
-static void fuse_notify_invalidate_range(struct inode *inode, pgoff_t start,
-					 pgoff_t end, bool may_be_dirty)
+static void fuse_invalidate_mapping_range(struct inode *inode, pgoff_t start,
+					  pgoff_t end, bool may_be_dirty)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	loff_t last;
@@ -1128,7 +1140,7 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			 * writeback to block on.  Either way a server that
 			 * revokes from a thread it also needs to answer
 			 * FUSE_WRITE on deadlocks here, the same contract
-			 * fuse_notify_invalidate_range() states for a frozen
+			 * fuse_invalidate_mapping_range() states for a frozen
 			 * inode.  The error is left to the mapping, where
 			 * fsync collects it.
 			 */
@@ -1158,11 +1170,12 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			 * cached there.
 			 */
 			if (fuse_inode_force_dio(inode))
-				fuse_notify_invalidate_range(inode, 0, -1, true);
+				fuse_invalidate_mapping_range(inode, 0, -1,
+							      true);
 			else if (has_pages)
-				fuse_notify_invalidate_range(inode, pg_start,
-							     pg_end,
-							     may_be_dirty);
+				fuse_invalidate_mapping_range(inode, pg_start,
+							      pg_end,
+							      may_be_dirty);
 
 			if (latched)
 				pr_info_ratelimited("FUSE: inode %llu latched to direct IO on invalidation notify storm\n",
@@ -1175,8 +1188,8 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			 */
 			if (fc->dlm && fc->writeback_cache)
 				fuse_dlm_revoke_inval_range(fi, offset, len);
-			fuse_notify_invalidate_range(inode, pg_start, pg_end,
-						     true);
+			fuse_invalidate_mapping_range(inode, pg_start, pg_end,
+						      true);
 		}
 		if (fenced)
 			fuse_dlm_revoke_end(fi, &fence);
