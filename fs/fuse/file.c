@@ -3618,9 +3618,18 @@ static bool fuse_writepage_need_send(struct fuse_conn *fc, struct page *page,
 
 	/* Reached alignment */
 	if (fc->alignment_pages && !(page->index % fc->alignment_pages)) {
-		/* we are at a point where we would write aligned
-		 * check if we potentially could reach the next alignment */
-		if (page->index + fc->alignment_pages > wbc->range_end)
+		/*
+		 * We are at a point where we would write aligned, so check
+		 * whether the next alignment is still inside the range this
+		 * pass covers.  Both sides in page indices: wbc->range_end is
+		 * a byte offset, and it carries nothing at all for a cyclic
+		 * writeback, where write_cache_pages() runs to the end of the
+		 * mapping instead.
+		 */
+		pgoff_t last = wbc->range_cyclic ? (pgoff_t) -1 :
+			       (pgoff_t) (wbc->range_end >> PAGE_SHIFT);
+
+		if (page->index + fc->alignment_pages > last)
 			return true;
 
 		if (ap->num_pages + fc->alignment_pages > fc->max_pages)
