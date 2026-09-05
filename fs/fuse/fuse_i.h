@@ -1330,6 +1330,15 @@ struct fuse_io_args {
 		struct {
 			struct fuse_read_in in;
 			u64 attr_ver;
+			/*
+			 * The grant the folios are filled under, held
+			 * from the request until the reply has filled
+			 * them; see fuse_send_readpages().  @dlm_fi is
+			 * the inode to drop it on, and NULL when there
+			 * is no pin to drop.
+			 */
+			struct fuse_dlm_span dlm_pin;
+			struct fuse_inode *dlm_fi;
 		} read;
 		struct {
 			struct fuse_write_in in;

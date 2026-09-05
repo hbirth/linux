@@ -1191,19 +1191,39 @@ static void fuse_readpages_end(struct fuse_mount *fm, struct fuse_args *args,
 		folio_end_read(folio, !err);
 		folio_put(folio);
 	}
+
+	/*
+	 * Dropped after the folios, which are filled, uptodate and unlocked
+	 * by now: a revoke draining this pin finds them and takes them out.
+	 * Held until here so it cannot have swept before they were there.
+	 */
+	if (ia->read.dlm_fi)
+		fuse_dlm_unpin_span(ia->read.dlm_fi, &ia->read.dlm_pin);
+
 	if (ia->ff)
 		fuse_file_put(ia->ff, false);
 
 	fuse_io_free(ia);
 }
 
-static void fuse_send_readpages(struct fuse_io_args *ia, struct file *file)
+/**
+ * fuse_send_readpages - read a run of pages of a readahead window
+ * @ia: the request, owning the pages and the pin over them
+ * @file: file to read through
+ *
+ * Return: 0 once the request is on its way or has been completed,
+ * -EAGAIN when a revoke of the range refused the grant and nothing was
+ * sent.  The pages are given back either way.
+ */
+static int fuse_send_readpages(struct fuse_io_args *ia, struct file *file)
 {
 	struct fuse_file *ff = file->private_data;
 	struct fuse_mount *fm = ff->fm;
+	struct fuse_inode *fi = get_fuse_inode(file_inode(file));
 	struct fuse_args_pages *ap = &ia->ap;
 	loff_t pos = page_offset(ap->pages[0]);
 	size_t count = ap->num_pages << PAGE_SHIFT;
+	unsigned int i;
 	ssize_t res;
 	int err;
 
@@ -1218,6 +1238,29 @@ static void fuse_send_readpages(struct fuse_io_args *ia, struct file *file)
 	}
 	WARN_ON((loff_t) (pos + count) < 0);
 
+	/*
+	 * The grant fuse_readahead() took, confirmed under a pin and held
+	 * until the reply has filled the pages.  A revoke of the range
+	 * waits for that, so the reply cannot be fetched under a grant the
+	 * server has since handed on, and cannot land behind a sweep that
+	 * would leave the pages uptodate and covered by nothing.
+	 *
+	 * Refused, or gone since it was asked for: give the pages back
+	 * unfilled rather than serve what no lock covers.  The read that
+	 * wanted them comes back through fuse_read_folio(), which asks
+	 * again with no page held.
+	 */
+	if (fm->fc->dlm && fm->fc->writeback_cache) {
+		if (!fuse_dlm_trypin_span(fi, &ia->read.dlm_pin, pos, count))
+			goto uncovered;
+		if (!fuse_dlm_lock_is_held(fi, pos, count,
+					   FUSE_PAGE_LOCK_READ)) {
+			fuse_dlm_unpin_span(fi, &ia->read.dlm_pin);
+			goto uncovered;
+		}
+		ia->read.dlm_fi = fi;
+	}
+
 	fuse_read_args_fill(ia, file, pos, count, FUSE_READ);
 	ia->read.attr_ver = fuse_get_attr_version(fm->fc);
 	if (fm->fc->async_read) {
@@ -1225,12 +1268,23 @@ static void fuse_send_readpages(struct fuse_io_args *ia, struct file *file)
 		ap->args.end = fuse_readpages_end;
 		err = fuse_simple_background(fm, &ap->args, GFP_KERNEL);
 		if (!err)
-			return;
+			return 0;
 	} else {
 		res = fuse_simple_request(fm, &ap->args);
 		err = res < 0 ? res : 0;
 	}
 	fuse_readpages_end(fm, &ap->args, err);
+	return 0;
+
+uncovered:
+	for (i = 0; i < ap->num_pages; i++) {
+		struct folio *folio = page_folio(ap->pages[i]);
+
+		folio_end_read(folio, false);
+		folio_put(folio);
+	}
+	fuse_io_free(ia);
+	return -EAGAIN;
 }
 
 /*
@@ -1409,6 +1463,11 @@ static void fuse_readahead(struct readahead_control *rac)
 	 * @rac, so the window that gets populated is the window that is
 	 * covered.
 	 *
+	 * The grant is only asked for here.  Confirming it and holding it
+	 * against a revoke is fuse_send_readpages(), one run of pages at a
+	 * time, since that is where the request the reply fills them from
+	 * goes out; a run it declines ends the window.
+	 *
 	 * The grant covers the window this call intends rather than the one
 	 * it ends up with, since the folios past what mm built are not
 	 * allocated yet.  readahead_expand() stops at the first folio already
@@ -1505,7 +1564,8 @@ static void fuse_readahead(struct readahead_control *rac)
 			ap->descs[i].length = PAGE_SIZE;
 		}
 		ap->num_pages = nr_pages;
-		fuse_send_readpages(ia, rac->file);
+		if (fuse_send_readpages(ia, rac->file))
+			break;
 	}
 
 	/*
@@ -1548,9 +1608,11 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	/*
 	 * A NOTIFY invalidate racing this read drops the folios it
 	 * supersedes, so the read either misses and refetches or returns
-	 * data that was current when it was copied.  There is nothing to
-	 * fence: unlike a write, a read leaves nothing behind that could
-	 * reach the server under a grant it no longer holds.
+	 * data that was current when it was copied.  What a read does leave
+	 * behind is the page cache it fills, which must not outlast the
+	 * grant it was fetched under; that is fenced where the filling
+	 * happens, in fuse_read_folio() and fuse_send_readpages(), and the
+	 * grant taken here is what they confirm.
 	 */
 	if (fuse_inode_force_dio(inode)) {
 		size_t count = iov_iter_count(to);
