@@ -498,9 +498,15 @@ u32 fuse_get_cache_mask(struct inode *inode)
  * for exactly what the grant covers:
  *
  *  - size, when the server reports less than i_size and the tail it does not
- *    know about, [attr->size, i_size), is entirely under a write grant.
- *    Taking the server's answer would shrink i_size and have
- *    truncate_pagecache() throw the unwritten tail away.
+ *    know about, [attr->size, i_size), is under a write grant or still
+ *    cached.  Taking the server's answer would shrink i_size, and a shrink
+ *    is destructive here in a way it is not upstream, where the writeback
+ *    cache always keeps STATX_SIZE and this never runs: truncate_pagecache()
+ *    throws the tail away dirty or not, and fuse_send_writepage() crops the
+ *    requests already queued over it, ending their writeback as if they had
+ *    been sent.  Neither reports an error, so fsync() succeeds over the
+ *    hole.  Upstream only lowers i_size under fuse_set_nowrite(), which is
+ *    what makes both safe there.
  *  - mtime and ctime, while the page cache is dirty or under writeback: our
  *    writes have stamped them locally and the server's stamps predate them.
  *    Only while the cache is actually dirty, not for as long as a grant
@@ -509,9 +515,9 @@ u32 fuse_get_cache_mask(struct inode *inode)
  *    beyond that would hide a remote chown or chmod indefinitely.
  *
  * A remote truncate cannot slip through.  It has to revoke the grant first,
- * and the revoke launders the tail and drops the grant, so by the time the
- * smaller size is reported neither check holds and the server's answer is
- * applied as usual.  A grant the server made but that could not be recorded
+ * and the revoke launders the tail, drops the grant and drops the folios, so
+ * by the time the smaller size is reported none of the checks hold and the
+ * server's answer is applied as usual.  A grant the server made but that could not be recorded
  * (FUSE_DLM_GRANT_UNRECORDED) is invisible to the lock tree and falls back to
  * trusting the server, as before.
  *
@@ -542,25 +548,37 @@ static u32 fuse_attr_cache_mask(struct inode *inode, struct fuse_attr *attr,
 
 	/*
 	 * The local size stays authoritative while the extension is
-	 * covered by a write grant, and also while anything in
-	 * [attr->size, size) is dirty or under writeback: those bytes
-	 * exist only here, and taking the server's smaller size would
-	 * truncate them away before they are ever sent.  The grant check
-	 * alone misses them, because a page-mkwrite grant is never
+	 * covered by a write grant, and also while [attr->size, size) is
+	 * cached at all: taking the server's smaller size would truncate
+	 * those folios away, and lowering i_size crops the writeback
+	 * requests already queued over them (fuse_send_writepage()), both
+	 * of which throw bytes away without reporting an error.  The grant
+	 * check alone misses them, because a page-mkwrite grant is never
 	 * recorded and a local truncate revokes its own tail grants.
 	 *
-	 * Both miss a write that has committed its extension and not yet
-	 * dirtied the folio under it: nothing is dirty there, and a NOTIFY
-	 * can revoke the grant in between.  With i_rwsem held shared several
-	 * writers sit in that window at once, which is why they are counted
-	 * rather than flagged.
+	 * Any folio, not just a dirty one.  A reply that is merely behind
+	 * -- the server has not seen the tail yet -- always has those
+	 * folios here, but not always dirty: writeback can have cleaned
+	 * one while the reply that would move the server's size was still
+	 * on the wire, and the beyond-EOF shortcut in fuse_write_begin()
+	 * turns a short i_size into a folio zeroed over data the server
+	 * does hold.  A remote truncate is not caught by mistake: it has
+	 * to revoke first, and the revoke drops the range, so by the time
+	 * the smaller size is reported there is nothing cached there and
+	 * the shrink applies.
+	 *
+	 * All three miss a write that has committed its extension and not
+	 * yet dirtied the folio under it: nothing is cached there, and a
+	 * NOTIFY can revoke the grant in between.  With i_rwsem held
+	 * shared several writers sit in that window at once, which is why
+	 * they are counted rather than flagged.  Cheapest test first: the
+	 * grant query sleeps.
 	 */
 	if (have_size && size > (loff_t) attr->size &&
 	    (atomic_read(&fi->size_extenders) ||
+	     filemap_range_has_page(inode->i_mapping, attr->size, size - 1) ||
 	     fuse_dlm_lock_is_held(fi, attr->size, size - attr->size,
-				   FUSE_PAGE_LOCK_WRITE) ||
-	     filemap_range_needs_writeback(inode->i_mapping, attr->size,
-					   size - 1)))
+				   FUSE_PAGE_LOCK_WRITE)))
 		cache_mask |= STATX_SIZE;
 
 	return cache_mask;
