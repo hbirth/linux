@@ -3399,6 +3399,9 @@ static int fuse_write_end(struct file *file, struct address_space *mapping,
 		struct folio *folio, void *fsdata)
 {
 	struct inode *inode = folio->mapping->host;
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	bool extending;
 
 	/* Haven't copied anything?  Skip zeroing, size extending, dirtying. */
 	if (!copied)
@@ -3426,17 +3429,40 @@ static int fuse_write_end(struct file *file, struct address_space *mapping,
 	 * beyond-EOF optimisation effective: folios wholly past EOF are zeroed
 	 * locally instead of sending the server a read-modify-write READ for
 	 * data that does not exist yet.
+	 *
+	 * Count the extension until the folio under it is dirty: in between,
+	 * [old size, pos) is covered by nothing fuse_attr_cache_mask() can
+	 * see, and a reply that leaves in that window would shrink i_size
+	 * back.  With i_rwsem held shared several writers sit there at once,
+	 * which is why they are counted rather than flagged.
 	 */
-	if (pos > inode->i_size) {
-		struct fuse_inode *fi = get_fuse_inode(inode);
+	extending = pos > inode->i_size;
+	if (extending) {
+		atomic_inc(&fi->size_extenders);
 
 		spin_lock(&fi->lock);
-		if (pos > inode->i_size)
+		if (pos > inode->i_size) {
+			/*
+			 * Retire the attribute replies already on the wire.
+			 * fuse_attr_cache_mask() decides whether the server's
+			 * size wins from an i_size it read before this commit
+			 * and before it slept in the grant query, so a GETATTR
+			 * that left while i_size still matched the server's is
+			 * applied afterwards and shrinks it back.  Moving
+			 * attr_version makes fuse_change_attributes_i() drop
+			 * those replies, which is what fuse_write_update_attr()
+			 * moves it for.
+			 */
+			fi->attr_version = atomic64_inc_return(&fc->attr_version);
 			i_size_write(inode, pos);
+		}
 		spin_unlock(&fi->lock);
 	}
 
 	folio_mark_dirty(folio);
+
+	if (extending)
+		atomic_dec(&fi->size_extenders);
 
 unlock:
 	folio_unlock(folio);
@@ -4454,6 +4480,7 @@ void fuse_init_file_inode(struct inode *inode, unsigned int flags)
 	fi->write_stream_run = 0;
 	fi->write_stream_next = 0;
 	fi->write_stream_start = 0;
+	atomic_set(&fi->size_extenders, 0);
 
 	if (IS_ENABLED(CONFIG_FUSE_DAX))
 		fuse_dax_inode_init(inode, flags);
