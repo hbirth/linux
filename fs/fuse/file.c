@@ -16,6 +16,7 @@
 #include <linux/sched/signal.h>
 #include <linux/module.h>
 #include <linux/swap.h>
+#include <linux/fadvise.h>
 #include <linux/falloc.h>
 #include <linux/uio.h>
 #include <linux/fs.h>
@@ -4833,6 +4834,21 @@ int fuse_migrate_folio(struct address_space *mapping, struct folio *dst,
 #endif
 
 
+/*
+ * POSIX_FADV_WILLNEED, and readahead(2) with it, populate the page cache
+ * through ->readahead, which runs with the pages locked.  Ask for the
+ * grant that fill needs while nothing is held; a window no grant covers
+ * is given back unfilled.
+ */
+static int fuse_fadvise(struct file *file, loff_t offset, loff_t len,
+			int advice)
+{
+	if (advice == POSIX_FADV_WILLNEED && offset >= 0 && len > 0)
+		fuse_read_grant(file, offset, len);
+
+	return generic_fadvise(file, offset, len, advice);
+}
+
 static const struct file_operations fuse_file_operations = {
 	.llseek		= fuse_file_llseek,
 	.read_iter	= fuse_file_read_iter,
@@ -4852,6 +4868,7 @@ static const struct file_operations fuse_file_operations = {
 	.poll		= fuse_file_poll,
 	.fallocate	= fuse_file_fallocate,
 	.copy_file_range = fuse_copy_file_range,
+	.fadvise	= fuse_fadvise,
 };
 
 static const struct address_space_operations fuse_file_aops  = {
