@@ -3543,13 +3543,6 @@ static struct fuse_file *__fuse_write_file_get(struct fuse_inode *fi)
 	return ff;
 }
 
-static struct fuse_file *fuse_write_file_get(struct fuse_inode *fi)
-{
-	struct fuse_file *ff = __fuse_write_file_get(fi);
-	WARN_ON(!ff);
-	return ff;
-}
-
 int fuse_write_inode(struct inode *inode, struct writeback_control *wbc)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
@@ -3633,13 +3626,6 @@ static struct fuse_writepage_args *fuse_writepage_args_setup(struct folio *folio
 	return wpa;
 }
 
-/*
- * How many times a data integrity writeback goes round for runs it had to
- * skip.  Each pass takes the grants the one before it deferred, so one more
- * is normally enough; the cap is there because a revoke can take them again.
- */
-#define FUSE_WB_DEFER_PASSES 4
-
 struct fuse_fill_wb_data {
 	struct fuse_writepage_args *wpa;
 	struct fuse_file *ff;
@@ -3667,10 +3653,19 @@ struct fuse_fill_wb_data {
 	/* fuse_iomap_writeback_submit() took that range back */
 	bool regranted;
 	/*
-	 * A folio whose run was skipped, held by a reference until it can be
-	 * put back on the dirty list; see fuse_writeback_redirty().
+	 * Reference to a folio whose run was skipped and kept under writeback
+	 * for redirty_len bytes until it can be put back on the dirty list;
+	 * see fuse_writeback_redirty().
 	 */
 	struct folio *redirty;
+	unsigned int redirty_len;
+	/*
+	 * An error a run hit that was deferred rather than returned, so its
+	 * bytes stayed put: no writer handle, a failed regrant (in the range
+	 * callback or in the submit), or no memory.  Reported from
+	 * fuse_iomap_writeback_submit().
+	 */
+	int defer_err;
 };
 
 static bool fuse_pages_realloc(struct fuse_fill_wb_data *data,
@@ -3793,6 +3788,17 @@ static bool fuse_writepage_need_send(struct fuse_conn *fc,
  * ->writepages path is the next call or the submit, and in
  * fuse_launder_folio() is the submit it makes itself.
  *
+ * And keep it under writeback until then.  Once iomap_writeback_folio()
+ * has cleared the folio and iomap_writepages() has unlocked it, a folio
+ * that is not dirty and not under writeback is anyone's: reclaim cannot
+ * take it while the reference is held, but invalidate_inode_pages2_range()
+ * does not look at references, and a revoke's invalidation landing in that
+ * window removed the folio with its bytes never sent.  The run's bytes are
+ * counted on the folio as pending (iomap_start_folio_write()), the way a
+ * queued run's are, and reported back only after the folio is dirty
+ * again.  A folio under writeback is neither reclaimed nor invalidated, so
+ * there is no window; the revoke waits for it, as it would for a send.
+ *
  * Only while there is a connection left to take the bytes.  After an abort
  * every send fails, and a folio redirtied for a retry that can no longer
  * happen would keep sync() going forever.
@@ -3802,31 +3808,41 @@ static void fuse_writeback_redirty_done(struct fuse_conn *fc,
 					struct writeback_control *wbc)
 {
 	struct folio *folio = data->redirty;
+	unsigned int len = data->redirty_len;
 
 	if (!folio)
 		return;
 	data->redirty = NULL;
+	data->redirty_len = 0;
 
 	if (READ_ONCE(fc->connected)) {
 		folio_mark_dirty(folio);
 		if (wbc)
 			wbc->pages_skipped += folio_nr_pages(folio);
 	}
+	/* Dirty again (or abandoned), so the writeback can end now */
+	iomap_finish_folio_write(folio->mapping->host, folio, len);
 	folio_put(folio);
 }
 
-/* Remember @folio for fuse_writeback_redirty_done() */
+/*
+ * Remember @folio for fuse_writeback_redirty_done(), with the run
+ * [@pos, @pos + @len) of it counted as pending writeback.  The caller
+ * reports the run to iomap as handled (@len, not a hole), so iomap leaves
+ * the folio under writeback for it.
+ */
 static void fuse_writeback_redirty(struct fuse_conn *fc,
 				   struct fuse_fill_wb_data *data,
 				   struct writeback_control *wbc,
-				   struct folio *folio)
+				   struct folio *folio, unsigned int len)
 {
-	if (data->redirty == folio)
-		return;
-
-	fuse_writeback_redirty_done(fc, data, wbc);
-	folio_get(folio);
-	data->redirty = folio;
+	if (data->redirty != folio) {
+		fuse_writeback_redirty_done(fc, data, wbc);
+		folio_get(folio);
+		data->redirty = folio;
+	}
+	iomap_start_folio_write(folio->mapping->host, folio, len);
+	data->redirty_len += len;
 }
 
 static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
@@ -3845,22 +3861,6 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 
 	WARN_ON_ONCE(!data);
 
-	if (!data->ff) {
-		data->ff = fuse_write_file_get(fi);
-		if (!data->ff) {
-			/*
-			 * No file left open for writing, which
-			 * fuse_open()'s invalidate reaches through
-			 * fuse_launder_folio() once the last writer has
-			 * closed.  The bytes are still the newest there
-			 * are, so keep them: dropping them here loses a
-			 * write that fsync and close both reported done.
-			 */
-			fuse_writeback_redirty(fc, data, wpc->wbc, folio);
-			return -EIO;
-		}
-	}
-
 	/*
 	 * A folio iomap has not asked about before: the one before it has all
 	 * of its runs queued.
@@ -3873,6 +3873,34 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 		 * folio held from then can go back on the dirty list now.
 		 */
 		fuse_writeback_redirty_done(fc, data, wpc->wbc);
+	}
+
+	/*
+	 * Every run that cannot be sent is deferred the same way, whatever
+	 * the reason: the folio stays under writeback for it and is dirtied
+	 * again once iomap has let go of it (fuse_writeback_redirty()), and
+	 * an error is kept for the submit to report rather than returned
+	 * here, where iomap would end the folio's writeback with the bytes
+	 * still to send and nothing keeping them.
+	 */
+	wpc->iomap.type = IOMAP_MAPPED;
+
+	if (!data->ff) {
+		data->ff = __fuse_write_file_get(fi);
+		if (!data->ff) {
+			/*
+			 * No file left open for writing, which
+			 * fuse_open()'s invalidate reaches through
+			 * fuse_launder_folio() once the last writer has
+			 * closed.  The bytes are still the newest there
+			 * are, so keep them: dropping them here loses a
+			 * write that fsync and close both reported done.
+			 */
+			fuse_writeback_redirty(fc, data, wpc->wbc, folio, len);
+			if (!data->defer_err)
+				data->defer_err = -EIO;
+			return len;
+		}
 	}
 
 	/*
@@ -3898,15 +3926,6 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 		int err;
 
 		/*
-		 * wpc->iomap.type carries over from the previous run and from
-		 * the previous folio, so anything that is queued has to say
-		 * so.  Left at a stale IOMAP_HOLE, iomap takes the folio for
-		 * one it never queued and ends its writeback while the write
-		 * is still in flight.
-		 */
-		wpc->iomap.type = IOMAP_MAPPED;
-
-		/*
 		 * The revoke handler flushing the range it is taking
 		 * away.  That lock is still this client's until the
 		 * handler returns, so send without asking: the record has
@@ -3927,8 +3946,9 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 		 * held.  read_folio() has AOP_TRUNCATED_PAGE to unlock and
 		 * retry with; ->writeback_range has nothing of the sort.
 		 *
-		 * Report the run as a hole instead.  The folio goes back on
-		 * the dirty list, the range is remembered for
+		 * Defer the run instead.  The folio stays under writeback
+		 * and goes back on the dirty list once iomap has let go of
+		 * it, the range is remembered for
 		 * fuse_iomap_writeback_submit() to take back with no folio
 		 * held, and the pass that follows sends it.  Nothing is lost
 		 * and no error is recorded for a later fsync to report.
@@ -3945,7 +3965,7 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 		}
 
 		if (!pinned) {
-			fuse_writeback_redirty(fc, data, wpc->wbc, folio);
+			fuse_writeback_redirty(fc, data, wpc->wbc, folio, len);
 			if (data->regrant_end <= data->regrant_start) {
 				data->regrant_start = pos;
 				data->regrant_end = pos + len;
@@ -3966,7 +3986,6 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 					data->regrant_end = e;
 				}
 			}
-			wpc->iomap.type = IOMAP_HOLE;
 			return len;
 		}
 
@@ -3978,9 +3997,11 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 		err = fuse_dlm_regrant_range(data->ff, inode, pos,
 					     pos + len - 1);
 		if (err < 0 && err != -ENOSYS) {
-			fuse_writeback_redirty(fc, data, wpc->wbc, folio);
+			fuse_writeback_redirty(fc, data, wpc->wbc, folio, len);
 			fuse_dlm_unpin(fi);
-			return err;
+			if (!data->defer_err)
+				data->defer_err = err;
+			return len;
 		}
 	}
 queue:
@@ -3996,10 +4017,12 @@ queue:
 	if (data->wpa == NULL) {
 		wpa = fuse_writepage_args_setup(folio, offset, data->ff);
 		if (!wpa) {
-			fuse_writeback_redirty(fc, data, wpc->wbc, folio);
+			fuse_writeback_redirty(fc, data, wpc->wbc, folio, len);
 			if (pinned)
 				fuse_dlm_unpin(fi);
-			return -ENOMEM;
+			if (!data->defer_err)
+				data->defer_err = -ENOMEM;
+			return len;
 		}
 		fuse_file_get(wpa->ia.ff);
 		data->max_folios = 1;
@@ -4064,14 +4087,44 @@ static int fuse_iomap_writeback_submit(struct iomap_writepage_ctx *wpc,
 	 */
 	if (wpc->wbc && data->ff && data->regrant_end > data->regrant_start &&
 	    !fuse_in_notify_ctx()) {
-		fuse_dlm_regrant_range(data->ff, wpc->inode,
-				       data->regrant_start,
-				       data->regrant_end - 1);
-		data->regranted = true;
+		int err = fuse_dlm_regrant_range(data->ff, wpc->inode,
+						 data->regrant_start,
+						 data->regrant_end - 1);
+
+		/*
+		 * Capture a deferred err so that a sync writeback knows that a
+		 * grant is not coming rather than continuing to loop waiting for
+		 * it.  Otherwise the runs should stay dirty for a later pass.
+		 *
+		 * A grant the server gave and this client could not record is
+		 * one of those.  It is invisible to fuse_dlm_lock_is_held(), so
+		 * the pass that follows defers every run again and comes
+		 * straight back here, for as long as the allocation keeps
+		 * failing.  Report it as the read side does rather than spin;
+		 * see fuse_read_folio_retry().
+		 */
+		if (err < 0 && err != -ENOSYS) {
+			if (!data->defer_err)
+				data->defer_err = err;
+		} else if (err > 0) {
+			if (!data->defer_err)
+				data->defer_err = -ENOMEM;
+		} else {
+			data->regranted = true;
+		}
 	}
 
 	if (data->ff)
 		fuse_file_put(data->ff, false);
+
+	/*
+	 * A run deferred with an error keeps its bytes, so report the err the
+	 * same way a failed send would, so that fsync and close see it.
+	 */
+	if (data->defer_err && !error) {
+		error = data->defer_err;
+		mapping_set_error(wpc->inode->i_mapping, error);
+	}
 
 	return error;
 }
@@ -4086,7 +4139,6 @@ static int fuse_writepages(struct address_space *mapping,
 {
 	struct inode *inode = mapping->host;
 	struct fuse_conn *fc = get_fuse_conn(inode);
-	unsigned int tries = FUSE_WB_DEFER_PASSES;
 	int err;
 
 	if (fuse_is_bad(inode))
@@ -4103,8 +4155,19 @@ static int fuse_writepages(struct address_space *mapping,
 	 * pass: fsync() and close() would report the bytes written while
 	 * they are still only in the page cache.  Go round again, now that
 	 * the grant is held, until nothing is left deferred.
+	 *
+	 * Without a cap on the passes: each one is paced by the regrant,
+	 * which the server answers once the revoke that refused the runs is
+	 * done, and a pass whose regrant fails reports that instead of
+	 * going round again.  A cap returned success with runs still dirty,
+	 * and a close that succeeded on that left the folios behind with no
+	 * handle to send them from.
+	 *
+	 * Bounded by the regrant rather than by a count, so a fatal signal
+	 * ends it as well: a grant taken away as often as it is given keeps
+	 * the loop going, and close() has to stay killable through it.
 	 */
-	do {
+	for (;;) {
 		struct fuse_fill_wb_data data = {};
 		struct iomap_writepage_ctx wpc = {
 			.inode = inode,
@@ -4122,7 +4185,12 @@ static int fuse_writepages(struct address_space *mapping,
 		 */
 		if (err || wbc->sync_mode != WB_SYNC_ALL || !data.regranted)
 			break;
-	} while (--tries);
+		if (fatal_signal_pending(current)) {
+			err = -EINTR;
+			break;
+		}
+		cond_resched();
+	}
 
 	return err;
 }
