@@ -527,6 +527,27 @@ static void fuse_prepare_release(struct fuse_inode *fi, struct fuse_file *ff,
 	ra->inode = sync ? NULL : igrab(&fi->inode);
 }
 
+/*
+ * Drop the page cache of an inode leaving the forced direct IO latch.
+ *
+ * Anything still dirty here is what a write racing the latch left behind, since
+ * the drain empties the mapping and nothing dirties it while it is on.  Send
+ * that with writeback rather than leave it to the drop: invalidate_inode_pages2()
+ * launders a folio at a time, a FUSE_WRITE per page for bytes writeback batches
+ * into max_write requests.  Errors stay on the mapping for fsync to collect.
+ *
+ * The usual case is an empty or clean mapping, where both calls are a load and
+ * the drop finds nothing to write.
+ */
+static void fuse_force_dio_drop(struct address_space *mapping)
+{
+	if (filemap_range_needs_writeback(mapping, 0, LLONG_MAX)) {
+		filemap_fdatawrite(mapping);
+		filemap_fdatawait_keep_errors(mapping);
+	}
+	invalidate_inode_pages2(mapping);
+}
+
 void fuse_file_release(struct inode *inode, struct fuse_file *ff,
 		       unsigned int open_flags, fl_owner_t id, bool isdir)
 {
@@ -544,12 +565,11 @@ void fuse_file_release(struct inode *inode, struct fuse_file *ff,
 	 * served stale once caching mode resumes.  No inode lock: release may
 	 * run on the fuse server thread (async fput from aio completion),
 	 * where blocking on a contended inode lock could stall the
-	 * connection.  Writes were routed direct while latched, so
-	 * only clean folios exist and this invalidate is server-free; the last
-	 * writer is gone, so no forced-dio writer can race the drop.
+	 * connection.  The last writer is gone, so no forced-dio writer can race
+	 * the drop.
 	 */
 	if (was_force_dio && !test_bit(FUSE_I_FORCE_DIO, &fi->state))
-		invalidate_inode_pages2(inode->i_mapping);
+		fuse_force_dio_drop(inode->i_mapping);
 
 	if (ra && ff->flock) {
 		ra->inarg.release_flags |= FUSE_RELEASE_FLOCK_UNLOCK;
@@ -3195,7 +3215,7 @@ static bool fuse_force_dio_active(struct inode *inode)
 	 * first, or set it again since; the bit decides, not this one's work.
 	 */
 	if (cleared)
-		invalidate_inode_pages2(inode->i_mapping);
+		fuse_force_dio_drop(inode->i_mapping);
 
 	return fuse_inode_force_dio(inode);
 }
@@ -4396,7 +4416,7 @@ static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
 		if (fi->iocachectr > 0)
 			set_bit(FUSE_I_CACHE_IO_MODE, &fi->state);
 		spin_unlock(&fi->lock);
-		invalidate_inode_pages2(file->f_mapping);
+		fuse_force_dio_drop(file->f_mapping);
 	}
 
 	/*
