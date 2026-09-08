@@ -3671,6 +3671,11 @@ struct fuse_fill_wb_data {
 	 * put back on the dirty list; see fuse_writeback_redirty().
 	 */
 	struct folio *redirty;
+	/*
+	 * Deferred run error returned from fuse_dlm_regrant_range() and
+	 * stored by fuse_iomap_writeback_submit()
+	 */
+	int defer_err;
 };
 
 static bool fuse_pages_realloc(struct fuse_fill_wb_data *data,
@@ -4064,14 +4069,34 @@ static int fuse_iomap_writeback_submit(struct iomap_writepage_ctx *wpc,
 	 */
 	if (wpc->wbc && data->ff && data->regrant_end > data->regrant_start &&
 	    !fuse_in_notify_ctx()) {
-		fuse_dlm_regrant_range(data->ff, wpc->inode,
-				       data->regrant_start,
-				       data->regrant_end - 1);
-		data->regranted = true;
+		int err = fuse_dlm_regrant_range(data->ff, wpc->inode,
+						 data->regrant_start,
+						 data->regrant_end - 1);
+
+		/*
+		 * Capture a deferred err so that a sync writeback knows that a
+		 * grant is not coming rather than continuing to loop waiting for
+		 * it.  Otherwise the runs should stay dirty for a later pass.
+		 */
+		if (err < 0 && err != -ENOSYS) {
+			if (!data->defer_err)
+				data->defer_err = err;
+		} else {
+			data->regranted = true;
+		}
 	}
 
 	if (data->ff)
 		fuse_file_put(data->ff, false);
+
+	/*
+	 * A run deferred with an error keeps its bytes, so report the err the
+	 * same way a failed send would, so that fsync and close see it.
+	 */
+	if (data->defer_err && !error) {
+		error = data->defer_err;
+		mapping_set_error(wpc->inode->i_mapping, error);
+	}
 
 	return error;
 }
