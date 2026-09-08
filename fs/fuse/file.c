@@ -1883,6 +1883,7 @@ ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
 {
 	int write = flags & FUSE_DIO_WRITE;
 	int cuse = flags & FUSE_DIO_CUSE;
+	int shared = flags & FUSE_DIO_SHARED;
 	struct file *file = io->iocb->ki_filp;
 	struct address_space *mapping = file->f_mapping;
 	struct inode *inode = mapping->host;
@@ -1911,12 +1912,32 @@ ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
 			return res;
 		}
 	}
-	if (!cuse && filemap_range_has_writeback(mapping, pos, pos + count - 1)) {
-		if (!write)
+
+	/*
+	 * Wait out the writeback this read or write would otherwise race:
+	 * a reply landing after it would put the superseded bytes on the
+	 * server on top of it.
+	 *
+	 * How to wait depends on the lock the caller holds.  fuse_set_nowrite()
+	 * asserts BUG_ON(fi->writectr < 0) and biases a counter the whole inode
+	 * shares, which only an exclusive i_rwsem makes safe; two callers
+	 * holding it shared reach that assertion together and the second one
+	 * dies inside spin_lock(&fi->lock).  A parallel direct write holds it
+	 * shared (fuse_dio_lock()), so it waits on the folios of its own range
+	 * instead, which is the range this test asked about anyway.  Errors are
+	 * left on the mapping for fsync to collect.
+	 */
+	if (!cuse && filemap_range_has_writeback(mapping, pos, (pos + count - 1))) {
+		if (!write) {
 			inode_lock(inode);
-		fuse_sync_writes(inode);
-		if (!write)
+			fuse_sync_writes(inode);
 			inode_unlock(inode);
+		} else if (shared) {
+			filemap_fdatawait_range_keep_errors(mapping, pos,
+							    pos + count - 1);
+		} else {
+			fuse_sync_writes(inode);
+		}
 	}
 
 	if (fopen_direct_io && write) {
@@ -1996,14 +2017,15 @@ static ssize_t __fuse_direct_read(struct fuse_io_priv *io,
 	return res;
 }
 
-static ssize_t fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter);
+static ssize_t __fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter,
+				bool exclusive);
 
 static ssize_t fuse_direct_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	ssize_t res;
 
 	if (!is_sync_kiocb(iocb) && iocb->ki_flags & IOCB_DIRECT) {
-		res = fuse_direct_IO(iocb, to);
+		res = __fuse_direct_IO(iocb, to, true);
 	} else {
 		struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(iocb);
 
@@ -2030,10 +2052,11 @@ static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		pos = iocb->ki_pos;
 
 		if (!is_sync_kiocb(iocb) && iocb->ki_flags & IOCB_DIRECT) {
-			res = fuse_direct_IO(iocb, from);
+			res = __fuse_direct_IO(iocb, from, exclusive);
 		} else {
 			res = fuse_direct_io(&io, from, &iocb->ki_pos,
-					     FUSE_DIO_WRITE);
+					     FUSE_DIO_WRITE |
+					     (exclusive ? 0 : FUSE_DIO_SHARED));
 			fuse_write_update_attr(inode, iocb->ki_pos, res);
 		}
 		if (res > 0 && mapping->nrpages) {
@@ -3201,7 +3224,7 @@ static inline loff_t fuse_round_up(struct fuse_conn *fc, loff_t off)
 }
 
 static ssize_t
-fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
+__fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter, bool exclusive)
 {
 	DECLARE_COMPLETION_ONSTACK(wait);
 	ssize_t ret = 0;
@@ -3271,7 +3294,8 @@ fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 	}
 
 	if (iov_iter_rw(iter) == WRITE) {
-		ret = fuse_direct_io(io, iter, &pos, FUSE_DIO_WRITE);
+		ret = fuse_direct_io(io, iter, &pos, FUSE_DIO_WRITE |
+				     (exclusive ? 0 : FUSE_DIO_SHARED));
 		fuse_invalidate_attr_mask(inode, FUSE_STATX_MODSIZE);
 	} else {
 		ret = __fuse_direct_read(io, iter, &pos);
@@ -3301,6 +3325,15 @@ fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 	}
 
 	return ret;
+}
+
+static ssize_t fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
+{
+	/*
+	 * Only reached via generic_file_direct_write/read() (caching-mode
+	 * O_DIRECT), which hold the inode lock exclusive.
+	 */
+	return __fuse_direct_IO(iocb, iter, true);
 }
 
 static int fuse_writeback_range(struct inode *inode, loff_t start, loff_t end)
