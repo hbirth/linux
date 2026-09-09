@@ -3725,13 +3725,6 @@ static struct fuse_writepage_args *fuse_writepage_args_setup(struct folio *folio
 	return wpa;
 }
 
-/*
- * How many times a data integrity writeback goes round for runs it had to
- * skip.  Each pass takes the grants the one before it deferred, so one more
- * is normally enough; the cap is there because a revoke can take them again.
- */
-#define FUSE_WB_DEFER_PASSES 4
-
 struct fuse_fill_wb_data {
 	struct fuse_writepage_args *wpa;
 	struct fuse_file *ff;
@@ -4227,7 +4220,6 @@ static int fuse_writepages(struct address_space *mapping,
 {
 	struct inode *inode = mapping->host;
 	struct fuse_conn *fc = get_fuse_conn(inode);
-	unsigned int tries = FUSE_WB_DEFER_PASSES;
 	int err;
 
 	if (fuse_is_bad(inode))
@@ -4244,8 +4236,19 @@ static int fuse_writepages(struct address_space *mapping,
 	 * pass: fsync() and close() would report the bytes written while
 	 * they are still only in the page cache.  Go round again, now that
 	 * the grant is held, until nothing is left deferred.
+	 *
+	 * Without a cap on the passes: each one is paced by the regrant,
+	 * which the server answers once the revoke that refused the runs is
+	 * done, and a pass whose regrant fails reports that instead of
+	 * going round again.  A cap returned success with runs still dirty,
+	 * and a close that succeeded on that left the folios behind with no
+	 * handle to send them from.
+	 *
+	 * Bounded by the regrant rather than by a count, so a fatal signal
+	 * ends it as well: a grant taken away as often as it is given keeps
+	 * the loop going, and close() has to stay killable through it.
 	 */
-	do {
+	for (;;) {
 		struct fuse_fill_wb_data data = {};
 		struct iomap_writepage_ctx wpc = {
 			.inode = inode,
@@ -4263,7 +4266,12 @@ static int fuse_writepages(struct address_space *mapping,
 		 */
 		if (err || wbc->sync_mode != WB_SYNC_ALL || !data.regranted)
 			break;
-	} while (--tries);
+		if (fatal_signal_pending(current)) {
+			err = -EINTR;
+			break;
+		}
+		cond_resched();
+	}
 
 	return err;
 }
