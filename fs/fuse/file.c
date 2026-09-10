@@ -1315,32 +1315,57 @@ static const struct iomap_read_ops fuse_iomap_read_ops = {
  * A read asks here, before anything is locked, and the fill paths only
  * confirm what this took.
  *
- * Readahead fills past the end of the read, so ask for a window beyond
- * it as well, bounded by the file since readahead stops there.  A run of
+ * Readahead fills past the end of the read, so ask for what it will fill
+ * as well, bounded by the file since readahead stops there.  A run of
  * folios no grant covers is given back unfilled and fetched one folio at
  * a time, so what is asked for here is what readahead is worth.
  *
+ * That is two windows, not one.  A read landing on the marker of the
+ * current window [s, s + W) has the next one, [s + W, s + 2W), submitted
+ * on its behalf (page_cache_async_ra()), and with a grant of one window
+ * past the read that next window ends up to W - count beyond the grant.
+ * With a server that grants exactly what is asked, nearly all of it was
+ * declined and refetched a folio at a time: 29024 of 32768 pages of a
+ * 32k-record stream, at 85 MiB/s against 2 GB/s.
+ *
+ * And what is needed is not what is asked for.  The need moves with
+ * every read, so a grant sized to it is never wide enough for the next
+ * read and a server that grants exactly is asked once per read(2): 4096
+ * round trips for 128 MiB of 32k records, at 500 MiB/s.  Ask only when
+ * the need is not already held, and then for two windows more than it,
+ * so the grant carries the reads across them before the next request.
+ * A server that grants wider is asked no more often than before.
+ *
  * Return: what fuse_get_dlm_lock() returned, 0 when there is nothing to
- * ask for.
+ * ask for or the need is already held.
  */
 static int fuse_read_grant(struct file *file, loff_t pos, size_t count)
 {
 	struct inode *inode = file_inode(file);
 	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_inode *fi = get_fuse_inode(inode);
 	loff_t size = i_size_read(inode);
-	loff_t ahead = (loff_t)file->f_ra.ra_pages << PAGE_SHIFT;
-	loff_t end = pos + count;
+	loff_t ahead = 2 * ((loff_t)file->f_ra.ra_pages << PAGE_SHIFT);
+	loff_t need = pos + count;
+	loff_t want;
 
 	if (!fc->writeback_cache || !fc->dlm)
 		return 0;
 
-	if (end < size)
-		end += min(ahead, size - end);
+	if (need < size)
+		need += min(ahead, size - need);
 
-	if (end <= pos)
+	if (need <= pos)
 		return 0;
 
-	return fuse_get_dlm_lock(file, pos, end - pos, FUSE_PAGE_LOCK_READ);
+	if (fuse_dlm_lock_is_held(fi, pos, need - pos, FUSE_PAGE_LOCK_READ))
+		return 0;
+
+	want = need;
+	if (want < size)
+		want += min(ahead, size - want);
+
+	return fuse_get_dlm_lock(file, pos, want - pos, FUSE_PAGE_LOCK_READ);
 }
 
 /**
