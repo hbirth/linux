@@ -211,18 +211,27 @@ int fuse_dlm_unlock_range(struct fuse_inode *inode, uint64_t start,
  */
 void fuse_dlm_pin(struct fuse_inode *inode, struct fuse_dlm_span *pin,
 		  loff_t offset, size_t length);
-bool fuse_dlm_trypin(struct fuse_inode *inode, struct fuse_dlm_span *pin,
-		     loff_t offset, size_t length);
 void fuse_dlm_unpin(struct fuse_inode *inode);
 
 /*
- * fuse_dlm_trypin() for a fill whose reply lands in another task: @pin
- * is dropped by node rather than by owner, and is live from the request
- * until fuse_dlm_unpin_span().
+ * The unpin of a fill whose reply lands in another task: @pin is dropped
+ * by node rather than by owner, and is live from the request until here.
  */
-bool fuse_dlm_trypin_span(struct fuse_inode *inode, struct fuse_dlm_span *pin,
-			  loff_t offset, size_t length);
 void fuse_dlm_unpin_span(struct fuse_inode *inode, struct fuse_dlm_span *pin);
+
+/*
+ * Pin a range and confirm the grant over it as one step, which is the
+ * order every IO site needs: pin first, confirm second, publish nothing
+ * if either fails.  False means the caller may not touch the page cache
+ * over that range yet, whether because a revoke is draining or because
+ * no grant covers it.
+ */
+bool fuse_dlm_trypin_held(struct fuse_inode *inode, struct fuse_dlm_span *pin,
+			  loff_t offset, size_t length,
+			  enum fuse_page_lock_mode mode);
+bool fuse_dlm_trypin_held_span(struct fuse_inode *inode,
+			       struct fuse_dlm_span *pin, loff_t offset,
+			       size_t length, enum fuse_page_lock_mode mode);
 
 /*
  * Fence the writers that hold a grant over [@offset, @offset + @len) but

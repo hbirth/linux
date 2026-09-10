@@ -1435,12 +1435,8 @@ static int fuse_read_folio(struct file *file, struct folio *folio)
 	 * closes the first.  Both fail into fuse_read_folio_retry().
 	 */
 	if (fc->dlm && fc->writeback_cache) {
-		pinned = fuse_dlm_trypin(fi, &pin, pos, len);
-		if (pinned && !fuse_dlm_lock_is_held(fi, pos, len,
-						     FUSE_PAGE_LOCK_READ)) {
-			fuse_dlm_unpin(fi);
-			pinned = false;
-		}
+		pinned = fuse_dlm_trypin_held(fi, &pin, pos, len,
+					      FUSE_PAGE_LOCK_READ);
 		if (!pinned)
 			return fuse_read_folio_retry(file, folio, pos, len);
 	}
@@ -1624,13 +1620,9 @@ static int fuse_send_readpages(struct fuse_io_args *ia, struct file *file,
 	 * again with no folio held.
 	 */
 	if (fm->fc->dlm && fm->fc->writeback_cache) {
-		if (!fuse_dlm_trypin_span(fi, &ia->read.dlm_pin, pos, count))
+		if (!fuse_dlm_trypin_held_span(fi, &ia->read.dlm_pin, pos,
+					       count, FUSE_PAGE_LOCK_READ))
 			goto uncovered;
-		if (!fuse_dlm_lock_is_held(fi, pos, count,
-					   FUSE_PAGE_LOCK_READ)) {
-			fuse_dlm_unpin_span(fi, &ia->read.dlm_pin);
-			goto uncovered;
-		}
 		ia->read.dlm_fi = fi;
 	}
 
@@ -4008,13 +4000,8 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 		 * leaves the run in the same place for the same reason.  A
 		 * revoke elsewhere in the file does not refuse it.
 		 */
-		pinned = fuse_dlm_trypin(fi, &pin, pos, len);
-		if (pinned && !fuse_dlm_lock_is_held(fi, pos, len,
-						     FUSE_PAGE_LOCK_WRITE)) {
-			fuse_dlm_unpin(fi);
-			pinned = false;
-		}
-
+		pinned = fuse_dlm_trypin_held(fi, &pin, pos, len,
+					      FUSE_PAGE_LOCK_WRITE);
 		if (!pinned) {
 			fuse_writeback_redirty(fc, data, wpc->wbc, folio, len);
 			if (data->regrant_end <= data->regrant_start) {
