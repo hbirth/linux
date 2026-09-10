@@ -3966,8 +3966,6 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 	}
 
 	if (fc->dlm && fc->writeback_cache) {
-		int err;
-
 		/*
 		 * The revoke handler flushing the range it is taking
 		 * away.  That lock is still this client's until the
@@ -4028,19 +4026,14 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 		}
 
 		/*
-		 * Held, and pinned so it stays held: this walks the record
-		 * and sends nothing.  It stays a call rather than the check
-		 * above so a grant that arrives between them is still used.
+		 * Confirmed and pinned, so the run goes out under a grant
+		 * that is held now and cannot be taken away before the
+		 * bytes are under writeback: a revoke of the range drains
+		 * the pins before fuse_dlm_unlock_range() removes anything,
+		 * and one already draining would have refused the pin.
+		 * Asking the record a second time here would answer the
+		 * same and cost a round of the cache lock per folio.
 		 */
-		err = fuse_dlm_regrant_range(data->ff, inode, pos,
-					     pos + len - 1);
-		if (err < 0 && err != -ENOSYS) {
-			fuse_writeback_redirty(fc, data, wpc->wbc, folio, len);
-			fuse_dlm_unpin(fi);
-			if (!data->defer_err)
-				data->defer_err = err;
-			return len;
-		}
 	}
 queue:
 
