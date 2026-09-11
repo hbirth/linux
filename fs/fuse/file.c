@@ -1337,7 +1337,12 @@ static const struct iomap_read_ops fuse_iomap_read_ops = {
  * A server that grants wider is asked no more often than before.
  *
  * Return: what fuse_get_dlm_lock() returned, 0 when there is nothing to
- * ask for or the need is already held.
+ * ask for or the need is already held.  A caller filling through the page
+ * cache can drop it: the fill confirms the grant itself and declines what
+ * this did not take, so the failure arrives there with a folio to report
+ * it on.  The two that cannot fall back on that act on it instead --
+ * fuse_read_folio_retry(), which would come straight back here, and
+ * fuse_fadvise(), which has nothing left to populate.
  */
 static int fuse_read_grant(struct file *file, loff_t pos, size_t count)
 {
@@ -5254,12 +5259,22 @@ static ssize_t fuse_copy_file_range(struct file *src_file, loff_t src_off,
  * through ->readahead, which runs with the folios locked.  Ask for the
  * grant that fill needs while nothing is held; a window no grant covers
  * is given back unfilled.
+ *
+ * Report a grant that could not be taken rather than populate anyway,
+ * which would fill nothing: every folio of the window is declined and
+ * dropped again.  A server without DLM answers -ENOSYS and has cleared
+ * fc->dlm, which is not a failure, and neither is a grant the server gave
+ * and the client could not record.
  */
 static int fuse_fadvise(struct file *file, loff_t offset, loff_t len,
 			int advice)
 {
-	if (advice == POSIX_FADV_WILLNEED && offset >= 0 && len > 0)
-		fuse_read_grant(file, offset, len);
+	if (advice == POSIX_FADV_WILLNEED && offset >= 0 && len > 0) {
+		int err = fuse_read_grant(file, offset, len);
+
+		if (err < 0 && err != -ENOSYS)
+			return err;
+	}
 
 	return generic_fadvise(file, offset, len, advice);
 }
