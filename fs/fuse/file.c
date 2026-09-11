@@ -1196,8 +1196,13 @@ static int fuse_read_folio_merge(struct file *file, struct folio *folio)
  *
  * Return: what fuse_get_dlm_lock() returned, 0 when there is nothing to
  * ask for or the need is already held.
+ *
+ * @wait keeps asking while the range stays contended.  A fault clears it:
+ * it holds mmap_lock over this and must not sit on an unbounded number of
+ * round trips there.
  */
-static int fuse_read_grant(struct file *file, loff_t pos, size_t count)
+static int fuse_read_grant(struct file *file, loff_t pos, size_t count,
+			   bool wait)
 {
 	struct inode *inode = file_inode(file);
 	struct fuse_conn *fc = get_fuse_conn(inode);
@@ -1236,7 +1241,8 @@ static int fuse_read_grant(struct file *file, loff_t pos, size_t count)
 	if (want < size)
 		want += min(ahead, size - want);
 
-	return fuse_get_dlm_lock(file, pos, want - pos, FUSE_PAGE_LOCK_READ);
+	return fuse_get_dlm_lock(file, pos, want - pos, FUSE_PAGE_LOCK_READ,
+				 wait);
 }
 
 /**
@@ -1265,10 +1271,12 @@ static int fuse_read_folio_retry(struct file *file, struct folio *folio,
 	folio_unlock(folio);
 
 	/* Wait the revoke out; what it leaves behind is asked for below */
-	fuse_dlm_pin(fi, &pin, pos, len);
+	err = fuse_dlm_pin(fi, &pin, pos, len);
+	if (err)
+		return err;
 	fuse_dlm_unpin(fi);
 
-	err = fuse_read_grant(file, pos, len);
+	err = fuse_read_grant(file, pos, len, true);
 	if (err == -ENOSYS)
 		return AOP_TRUNCATED_PAGE;
 	if (err < 0)
@@ -1792,7 +1800,7 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	 * cache, and what it reads is the server's to order.
 	 */
 	if (!(iocb->ki_flags & IOCB_DIRECT))
-		fuse_read_grant(file, iocb->ki_pos, count);
+		fuse_read_grant(file, iocb->ki_pos, count, true);
 
 	/*
 	 * A NOTIFY invalidate racing this read drops the folios it
@@ -2209,7 +2217,9 @@ static int fuse_dlm_pin_write(struct file *file, struct fuse_dlm_span *pin,
 	int err;
 
 	for (;;) {
-		fuse_dlm_pin(fi, pin, pos, len);
+		err = fuse_dlm_pin(fi, pin, pos, len);
+		if (err)
+			return err;
 		/*
 		 * A server that turned out to have no DLM leaves nothing to
 		 * confirm, and the pin still pairs with the caller's unpin.
@@ -2222,7 +2232,8 @@ static int fuse_dlm_pin_write(struct file *file, struct fuse_dlm_span *pin,
 		if (fatal_signal_pending(current))
 			return -EINTR;
 
-		err = fuse_get_dlm_lock(file, pos, len, FUSE_PAGE_LOCK_WRITE);
+		err = fuse_get_dlm_lock(file, pos, len, FUSE_PAGE_LOCK_WRITE,
+					true);
 		if (err < 0 && err != -ENOSYS)
 			return err;
 		if (err > 0) {
@@ -2231,8 +2242,7 @@ static int fuse_dlm_pin_write(struct file *file, struct fuse_dlm_span *pin,
 			 * confirmation above to find.  The range is covered
 			 * cluster-wide; pin and proceed.
 			 */
-			fuse_dlm_pin(fi, pin, pos, len);
-			return 0;
+			return fuse_dlm_pin(fi, pin, pos, len);
 		}
 	}
 }
@@ -2414,11 +2424,20 @@ static bool fuse_write_range_blocked(struct fuse_inode *fi,
  * this client against the cluster, not the tasks against each other.  No
  * revoke path takes this, so it may be held across a folio lock, a
  * read-modify-write and a grant request alike.
+ *
+ * Killable, because what is waited for is not bounded: the writer ahead
+ * may itself be parked on DLM round trips for as long as its range stays
+ * contended, and a task sitting here holds i_rwsem.
+ *
+ * Return: 0 with the bytes held, -EINTR if the wait was killed, in which
+ * case nothing is published and there is no unlock to pair.
  */
-static void fuse_write_range_lock(struct fuse_inode *fi,
-				  struct fuse_write_range *r, loff_t pos,
-				  size_t count)
+static int fuse_write_range_lock(struct fuse_inode *fi,
+				 struct fuse_write_range *r, loff_t pos,
+				 size_t count)
 {
+	int err = 0;
+
 	r->start = pos;
 	r->end = pos + count - 1;
 
@@ -2431,10 +2450,26 @@ static void fuse_write_range_lock(struct fuse_inode *fi,
 	list_add_tail(&r->list, &fi->wr_ranges);
 	while (fuse_write_range_blocked_locked(fi, r)) {
 		spin_unlock(&fi->wr_lock);
-		wait_event(fi->wr_wq, !fuse_write_range_blocked(fi, r));
+		err = wait_event_killable(fi->wr_wq,
+					  !fuse_write_range_blocked(fi, r));
 		spin_lock(&fi->wr_lock);
+		if (err) {
+			/*
+			 * Taken back off the list here rather than by an
+			 * unlock the caller no longer owes, and the writers
+			 * behind it woken: one of them may have been waiting
+			 * for this entry alone.
+			 */
+			list_del(&r->list);
+			spin_unlock(&fi->wr_lock);
+			wake_up_all(&fi->wr_wq);
+
+			return -EINTR;
+		}
 	}
 	spin_unlock(&fi->wr_lock);
+
+	return 0;
 }
 
 /**
@@ -2500,7 +2535,8 @@ static void fuse_cache_wr_unlock(struct inode *inode, bool exclusive)
  */
 static int fuse_cache_wr_dlm_lock(struct file *file, loff_t pos, size_t len)
 {
-	int err = fuse_get_dlm_lock(file, pos, len, FUSE_PAGE_LOCK_WRITE);
+	int err = fuse_get_dlm_lock(file, pos, len, FUSE_PAGE_LOCK_WRITE,
+				    true);
 
 	return (err < 0 && err != -ENOSYS) ? err : 0;
 }
@@ -2733,7 +2769,9 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	 * what the write covers.
 	 */
 	if (!exclusive) {
-		fuse_write_range_lock(fi, &wr, iocb->ki_pos, count);
+		err = fuse_write_range_lock(fi, &wr, iocb->ki_pos, count);
+		if (err)
+			goto out;
 		claimed = true;
 	}
 
@@ -3345,7 +3383,7 @@ static ssize_t fuse_splice_read(struct file *in, loff_t *ppos,
 	if (fuse_force_dio_active(file_inode(in)))
 		return copy_splice_read(in, ppos, pipe, len, flags);
 
-	fuse_read_grant(in, *ppos, len);
+	fuse_read_grant(in, *ppos, len, true);
 
 	return filemap_splice_read(in, ppos, pipe, len, flags);
 }
@@ -4055,12 +4093,21 @@ static int fuse_iomap_writeback_submit(struct iomap_writepage_ctx *wpc,
 	 * folio_unmap_invalidate(), which is the ordering this is avoiding,
 	 * and a revoke handler would ask for the very range it is revoking.
 	 * In both the skip simply stands and writeback picks it up.
+	 *
+	 * Only a data integrity pass waits for a contended range.  A
+	 * background one runs on a kworker, which gets neither of the exits
+	 * that wait ends on, and a range revoked as fast as it is granted
+	 * would park the flusher on this inode with every other one on the
+	 * mount behind it.  The runs stay dirty, which is where a background
+	 * pass leaves them anyway.
 	 */
 	if (wpc->wbc && data->ff && data->regrant_end > data->regrant_start &&
 	    !fuse_in_notify_ctx()) {
 		int err = fuse_dlm_regrant_range(data->ff, wpc->inode,
 						 data->regrant_start,
-						 data->regrant_end - 1);
+						 data->regrant_end - 1,
+						 wpc->wbc->sync_mode ==
+						 WB_SYNC_ALL);
 
 		/*
 		 * Capture a deferred err so that a sync writeback knows that a
@@ -4073,8 +4120,15 @@ static int fuse_iomap_writeback_submit(struct iomap_writepage_ctx *wpc,
 		 * straight back here, for as long as the allocation keeps
 		 * failing.  Report it as the read side does rather than spin;
 		 * see fuse_read_folio_retry().
+		 *
+		 * -EAGAIN is neither: it is this pass declining to wait a
+		 * contended range out, and the runs it left dirty are what a
+		 * background pass leaves behind in any case.  Nothing to
+		 * report and nothing regranted.
 		 */
-		if (err < 0 && err != -ENOSYS) {
+		if (err == -EAGAIN) {
+			/* Contended, and this pass does not wait */
+		} else if (err < 0 && err != -ENOSYS) {
 			if (!data->defer_err)
 				data->defer_err = err;
 		} else if (err > 0) {
@@ -4303,11 +4357,25 @@ static vm_fault_t fuse_page_mkwrite(struct vm_fault *vmf)
  * A read fault fills the page cache through ->read_folio and
  * ->readahead, which run with the folios locked.  Ask for the grant they
  * fill under before filemap_fault() locks any of them.
+ *
+ * Without waiting for a contended range.  This runs with mmap_lock held,
+ * which filemap_fault() drops for its own IO and cannot drop for this,
+ * and every mmap, munmap and brk in the process queues behind it -- and
+ * behind them, the rwsem being fair, every later faulter.  One round trip
+ * is what the grant is worth here.
+ *
+ * A NOWAIT fault takes none: it may not block at all.
+ *
+ * The result is dropped either way.  Without the grant the fill declines
+ * and comes back through fuse_read_folio_retry() with no folio held,
+ * which is where a fault that could not take it belongs.
  */
 static vm_fault_t fuse_filemap_fault(struct vm_fault *vmf)
 {
-	fuse_read_grant(vmf->vma->vm_file, (loff_t)vmf->pgoff << PAGE_SHIFT,
-			PAGE_SIZE);
+	if (!(vmf->flags & FAULT_FLAG_RETRY_NOWAIT))
+		fuse_read_grant(vmf->vma->vm_file,
+				(loff_t)vmf->pgoff << PAGE_SHIFT, PAGE_SIZE,
+				false);
 
 	return filemap_fault(vmf);
 }
@@ -5147,7 +5215,7 @@ static int fuse_fadvise(struct file *file, loff_t offset, loff_t len,
 			int advice)
 {
 	if (advice == POSIX_FADV_WILLNEED && offset >= 0 && len > 0)
-		fuse_read_grant(file, offset, len);
+		fuse_read_grant(file, offset, len, true);
 
 	return generic_fadvise(file, offset, len, advice);
 }
