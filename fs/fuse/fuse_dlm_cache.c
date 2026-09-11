@@ -1115,10 +1115,13 @@ static int __fuse_get_dlm_lock(struct fuse_file *ff, struct inode *inode,
 		 * write reports to a caller that has no reason to expect it.
 		 * Waiting the notifications out is the better answer.  A
 		 * fatal signal still ends it, so a killed task and close()
-		 * get out.
+		 * get out, and so does the inode going bad, which is the
+		 * exit a writeback kworker has.
 		 */
 		if (fatal_signal_pending(current))
 			return -EINTR;
+		if (fuse_is_bad(inode))
+			return -EIO;
 	}
 }
 
