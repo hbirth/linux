@@ -1686,14 +1686,22 @@ static int fuse_force_dio_drain(struct inode *inode)
 	 * is only owed to one that is still on.  On a flush error the bit stays
 	 * clear so the next IO tries again, and the error goes to this caller
 	 * rather than being left for a later fsync to find.
+	 *
+	 * The invalidate answers for itself the same way.  It reports -EBUSY
+	 * for a folio it could not take, which fuse_launder_folio() leaves
+	 * behind whenever a revoke of the range is draining, and the bit says
+	 * the mapping is empty for the rest of the latch: set over a folio
+	 * that survived, the direct writes bypass it while an established
+	 * mapping keeps serving it, and a writeback of it later lands the old
+	 * bytes on top of them.
 	 */
 	if (test_bit(FUSE_I_FORCE_DIO, &fi->state) &&
 	    !test_bit(FUSE_I_FORCE_DIO_DRAINED, &fi->state)) {
 		err = filemap_write_and_wait(inode->i_mapping);
-		if (!err) {
-			invalidate_inode_pages2(inode->i_mapping);
+		if (!err)
+			err = invalidate_inode_pages2(inode->i_mapping);
+		if (!err)
 			set_bit(FUSE_I_FORCE_DIO_DRAINED, &fi->state);
-		}
 	}
 	inode_unlock(inode);
 
@@ -2616,8 +2624,21 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	bool claimed = false;
 	bool exclusive;
 
-	if (fuse_inode_force_dio(inode))
+	/*
+	 * Draining first, as every other re-route does.  Getting here at all
+	 * means the latch was clear in fuse_file_write_iter(), so one set in
+	 * that window is exactly what the drain is for: a cached write that
+	 * had already passed both checks is still dirtying folios behind the
+	 * notify that dropped the mapping, and the direct path does not flush
+	 * them -- fuse_direct_io() flushes only for a file the server opened
+	 * FOPEN_DIRECT_IO.
+	 */
+	if (fuse_inode_force_dio(inode)) {
+		err = fuse_force_dio_drain(inode);
+		if (err)
+			return err;
 		return fuse_direct_write_iter(iocb, from);
+	}
 
 	if (fc->writeback_cache) {
 		/* Update mode for SUID clearing, and also update size if the file
