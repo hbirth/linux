@@ -89,12 +89,39 @@ static inline bool fuse_in_notify_ctx(void)
 	return fuse_notify_ctx();
 }
 
+/*
+ * The bounds of the revoke @ctx is running, page aligned outward: what it
+ * takes away is whole pages, every grant being page rounded, and
+ * fuse_dlm_revoke_begin() builds its fence from the same two lines.
+ */
+static inline void fuse_notify_ctx_pages(const struct fuse_notify_ctx *ctx,
+					 u64 *start, u64 *end)
+{
+	*start = (u64)ctx->start & PAGE_MASK;
+	*end = ctx->end >= LLONG_MAX ? U64_MAX :
+	       ((u64)ctx->end | (PAGE_SIZE - 1));
+}
+
 /* Is [@pos, @pos + @len) the range the revoke in progress is taking away? */
 static inline bool fuse_in_notify_range(loff_t pos, unsigned int len)
 {
 	struct fuse_notify_ctx *ctx = fuse_notify_ctx();
+	u64 start, end;
 
-	return ctx && pos >= ctx->start && pos + len - 1 <= ctx->end;
+	if (!ctx)
+		return false;
+
+	/*
+	 * Against the page bounds, not the raw ones.  A run whose folio the
+	 * notify covers only in part is one whose grant this handler is
+	 * dropping all the same, so it may be sent without asking; tested
+	 * byte for byte it was sent the long way round instead, deferred by
+	 * a grant that had already gone and refused a regrant because this
+	 * is a revoke handler.
+	 */
+	fuse_notify_ctx_pages(ctx, &start, &end);
+
+	return (u64)pos >= start && (u64)pos + len - 1 <= end;
 }
 
 /** Default max number of pages that can be used in a single read request */
