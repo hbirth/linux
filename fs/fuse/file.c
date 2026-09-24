@@ -2404,10 +2404,7 @@ static bool fuse_write_stream_update(struct fuse_inode *fi, size_t len)
  * A hint only: nothing waits for it, and a chunk that is partly dirty or
  * already written back sends what it has.  The run is read and written
  * without the inode lock, which the DLM path holds shared, so writers
- * landing on it together cost a kick, not correctness.  Each mark is read
- * once into a local for that to hold: reading write_stream_start twice,
- * to round down and again to compare, lets a writer moving it in between
- * invert the range the kick is given.
+ * landing on it together cost a kick, not correctness.
  */
 static void fuse_writeback_kick_stream(struct kiocb *iocb, loff_t pos,
 				       size_t len, bool stream)
@@ -2415,27 +2412,25 @@ static void fuse_writeback_kick_stream(struct kiocb *iocb, loff_t pos,
 	struct file *file = iocb->ki_filp;
 	struct inode *inode = file_inode(file);
 	struct fuse_inode *fi = get_fuse_inode(inode);
-	loff_t chunk, run, start, end;
+	loff_t chunk, start, end;
 	bool sequential;
 
-	sequential = pos == READ_ONCE(fi->write_stream_next);
-	WRITE_ONCE(fi->write_stream_next, pos + (loff_t)len);
+	sequential = pos == fi->write_stream_next;
+	fi->write_stream_next = pos + (loff_t)len;
 	if (!sequential || !stream) {
 		/* Nothing behind this write is known to be finished */
-		WRITE_ONCE(fi->write_stream_start, pos);
+		fi->write_stream_start = pos;
 		return;
 	}
 
-	run = READ_ONCE(fi->write_stream_start);
 	chunk = fuse_write_chunk_size(get_fuse_conn(inode));
-	start = round_down(run, chunk);
-	/* This write's own end, not the mark another writer may have moved */
-	end = round_down(pos + (loff_t)len, chunk);
+	start = round_down(fi->write_stream_start, chunk);
+	end = round_down(fi->write_stream_next, chunk);
 	/* No bound crossed, so nothing has been left complete */
-	if (end <= run)
+	if (end <= fi->write_stream_start)
 		return;
 
-	WRITE_ONCE(fi->write_stream_start, end);
+	fi->write_stream_start = end;
 	filemap_fdatawrite_range_kick(file->f_mapping, start, end - 1);
 }
 
