@@ -1599,6 +1599,7 @@ static ssize_t fuse_fill_write_pages(struct fuse_io_args *ia,
 {
 	struct fuse_args_pages *ap = &ia->ap;
 	struct fuse_conn *fc = get_fuse_conn(mapping->host);
+	unsigned offset = pos & (PAGE_SIZE - 1);
 	size_t count = 0;
 	unsigned int num;
 	int err = 0;
@@ -1625,13 +1626,7 @@ static ssize_t fuse_fill_write_pages(struct fuse_io_args *ia,
 		if (mapping_writably_mapped(mapping))
 			flush_dcache_folio(folio);
 
-		/*
-		 * From @pos, not carried across iterations: a write landing
-		 * inside a folio it does not start covers the rest of it, and
-		 * a residue kept from that lands the next folio's copy past
-		 * its end.
-		 */
-		folio_offset = offset_in_folio(folio, pos);
+		folio_offset = ((index - folio->index) << PAGE_SHIFT) + offset;
 		bytes = min(folio_size(folio) - folio_offset, num);
 
 		tmp = copy_folio_from_iter_atomic(folio, folio_offset, bytes, ii);
@@ -1661,6 +1656,9 @@ static ssize_t fuse_fill_write_pages(struct fuse_io_args *ia,
 		count += tmp;
 		pos += tmp;
 		num -= tmp;
+		offset += tmp;
+		if (offset == folio_size(folio))
+			offset = 0;
 
 		/* If we copied full folio, mark it uptodate */
 		if (tmp == folio_size(folio))
@@ -1672,12 +1670,7 @@ static ssize_t fuse_fill_write_pages(struct fuse_io_args *ia,
 			ia->write.folio_locked = true;
 			break;
 		}
-		/*
-		 * Carry on only from a folio boundary: a copy that stopped
-		 * short leaves the next one starting inside a folio, which is
-		 * one request's worth on its own.
-		 */
-		if (!fc->big_writes || folio_offset + tmp != folio_size(folio))
+		if (!fc->big_writes || offset != 0)
 			break;
 	}
 
@@ -3494,13 +3487,9 @@ static vm_fault_t fuse_page_mkwrite(struct vm_fault *vmf)
 	struct fuse_mount *fm = get_fuse_mount(inode);
 
 	if (fm->fc->dlm) {
-		/*
-		 * The whole folio is dirtied on the way out of this fault
-		 * (fault_dirty_shared_page()), so the lock has to cover the
-		 * folio, not the page that faulted.
-		 */
-		int err = fuse_get_page_mkwrite_lock(file, folio_pos(folio),
-						     folio_size(folio));
+		loff_t pos = vmf->pgoff << PAGE_SHIFT;
+		size_t length = PAGE_SIZE;
+		int err = fuse_get_page_mkwrite_lock(file, pos, length);
 		if (err < 0) {
 			return vmf_error(err);
 		}
