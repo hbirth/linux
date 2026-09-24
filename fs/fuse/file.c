@@ -442,7 +442,6 @@ static void fuse_prepare_release(struct fuse_inode *fi, struct fuse_file *ff,
 		if (writer && test_bit(FUSE_I_FORCE_DIO, &fi->state) &&
 		    list_empty(&fi->write_files)) {
 			clear_bit(FUSE_I_FORCE_DIO, &fi->state);
-			clear_bit(FUSE_I_FORCE_DIO_DRAINED, &fi->state);
 			if (fi->iocachectr > 0)
 				set_bit(FUSE_I_CACHE_IO_MODE, &fi->state);
 		}
@@ -1590,54 +1589,6 @@ static void fuse_readahead(struct readahead_control *rac)
 static ssize_t fuse_direct_read_iter(struct kiocb *iocb, struct iov_iter *to);
 
 /*
- * Empty the page cache of an inode just latched into direct IO.
- *
- * The notify that set the latch dropped the mapping, but it holds no inode
- * lock, so a cached write that had already passed both latch checks went on
- * dirtying folios behind it.  Left there, writeback would put them on the
- * server on top of the direct writes that replace them, and direct reads,
- * which do not look in the page cache, would miss them entirely.
- *
- * i_rwsem taken exclusive is what settles it: fuse_cache_write_iter() dirties
- * under it, so by the time it is held every such writer has finished, and none
- * can start behind this one.  A write that takes the lock afterwards rechecks
- * the latch and reroutes before it touches the cache.  So the mapping stays
- * empty from here on and the bit records that, leaving the latched IO paths
- * with nothing to flush.
- *
- * Called from the top of the IO paths, with no inode lock held.  A no-op for
- * a file the server itself opened direct, which is never latched.
- */
-static int fuse_force_dio_drain(struct inode *inode)
-{
-	struct fuse_inode *fi = get_fuse_inode(inode);
-	int err = 0;
-
-	if (!test_bit(FUSE_I_FORCE_DIO, &fi->state) ||
-	    test_bit(FUSE_I_FORCE_DIO_DRAINED, &fi->state))
-		return 0;
-
-	inode_lock(inode);
-	/*
-	 * The latch may have gone while this waited for the lock, and the drain
-	 * is only owed to one that is still on.  On a flush error the bit stays
-	 * clear so the next IO tries again, and the error goes to this caller
-	 * rather than being left for a later fsync to find.
-	 */
-	if (test_bit(FUSE_I_FORCE_DIO, &fi->state) &&
-	    !test_bit(FUSE_I_FORCE_DIO_DRAINED, &fi->state)) {
-		err = filemap_write_and_wait(inode->i_mapping);
-		if (!err) {
-			invalidate_inode_pages2(inode->i_mapping);
-			set_bit(FUSE_I_FORCE_DIO_DRAINED, &fi->state);
-		}
-	}
-	inode_unlock(inode);
-
-	return err;
-}
-
-/*
  * Fold one request size into a moving average of this inode's sizes and
  * report whether the file is being streamed: the same buffer size arriving
  * FUSE_STREAM_RUN times over, which is what a task working through a file a
@@ -1755,12 +1706,18 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	 */
 	if (fuse_inode_force_dio(inode)) {
 		/*
-		 * Latched between fuse_file_read_iter()'s check and this one,
-		 * so the drain it would have done falls here.
+		 * A write that passed this same check just before the latch
+		 * took hold dirtied the page cache after the notify dropped
+		 * it, and a direct read does not look there.  Send it first.
 		 */
-		res = fuse_force_dio_drain(inode);
-		if (res)
-			return res;
+		if (count) {
+			loff_t end = iocb->ki_pos + count - 1;
+
+			res = filemap_write_and_wait_range(mapping,
+							   iocb->ki_pos, end);
+			if (res)
+				return res;
+		}
 		return fuse_direct_read_iter(iocb, to);
 	}
 
@@ -2696,12 +2653,16 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 	if (fuse_inode_force_dio(inode)) {
 		/*
-		 * Latched while this write waited for the lock, so the drain
-		 * fuse_file_write_iter() would have done falls here.  Drop the
-		 * lock first: the drain takes it exclusive.
+		 * As on the read side, only worse: the direct write would
+		 * land under whatever a write racing the latch left dirty,
+		 * and the invalidate fuse_direct_write_iter() does after it
+		 * launders rather than drops, putting that folio on the
+		 * server on top.  Send it first and the order is ordinary.
 		 */
+		if (count)
+			err = filemap_write_and_wait_range(inode->i_mapping,
+					iocb->ki_pos, iocb->ki_pos + count - 1);
 		fuse_cache_wr_unlock(inode, exclusive);
-		err = fuse_force_dio_drain(inode);
 		if (err)
 			return err;
 		return fuse_direct_write_iter(iocb, from);
@@ -3228,7 +3189,6 @@ static bool fuse_force_dio_active(struct inode *inode)
 	if (test_bit(FUSE_I_FORCE_DIO, &fi->state) &&
 	    time_after(jiffies, fi->notify_stamp + FUSE_NOTIFY_DIO_COLD)) {
 		clear_bit(FUSE_I_FORCE_DIO, &fi->state);
-		clear_bit(FUSE_I_FORCE_DIO_DRAINED, &fi->state);
 		if (fi->iocachectr > 0)
 			set_bit(FUSE_I_CACHE_IO_MODE, &fi->state);
 		cleared = true;
@@ -3259,17 +3219,12 @@ static ssize_t fuse_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		return fuse_dax_read_iter(iocb, to);
 
 	/* FOPEN_DIRECT_IO overrides FOPEN_PASSTHROUGH */
-	if ((ff->open_flags & FOPEN_DIRECT_IO) || fuse_force_dio_active(inode)) {
-		ssize_t err = fuse_force_dio_drain(inode);
-
-		if (err)
-			return err;
+	if ((ff->open_flags & FOPEN_DIRECT_IO) || fuse_force_dio_active(inode))
 		return fuse_direct_read_iter(iocb, to);
-	} else if (fuse_file_passthrough(ff)) {
+	else if (fuse_file_passthrough(ff))
 		return fuse_passthrough_read_iter(iocb, to);
-	} else {
+	else
 		return fuse_cache_read_iter(iocb, to);
-	}
 }
 
 static ssize_t fuse_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
@@ -3285,17 +3240,12 @@ static ssize_t fuse_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		return fuse_dax_write_iter(iocb, from);
 
 	/* FOPEN_DIRECT_IO overrides FOPEN_PASSTHROUGH */
-	if ((ff->open_flags & FOPEN_DIRECT_IO) || fuse_force_dio_active(inode)) {
-		ssize_t err = fuse_force_dio_drain(inode);
-
-		if (err)
-			return err;
+	if ((ff->open_flags & FOPEN_DIRECT_IO) || fuse_force_dio_active(inode))
 		return fuse_direct_write_iter(iocb, from);
-	} else if (fuse_file_passthrough(ff)) {
+	else if (fuse_file_passthrough(ff))
 		return fuse_passthrough_write_iter(iocb, from);
-	} else {
+	else
 		return fuse_cache_write_iter(iocb, from);
-	}
 }
 
 static ssize_t fuse_splice_read(struct file *in, loff_t *ppos,
@@ -4290,7 +4240,6 @@ static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
 
 		spin_lock(&fi->lock);
 		clear_bit(FUSE_I_FORCE_DIO, &fi->state);
-		clear_bit(FUSE_I_FORCE_DIO_DRAINED, &fi->state);
 		if (fi->iocachectr > 0)
 			set_bit(FUSE_I_CACHE_IO_MODE, &fi->state);
 		spin_unlock(&fi->lock);

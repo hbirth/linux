@@ -412,16 +412,10 @@ enum {
 	 * Latched into direct IO: a NOTIFY_INVAL_INODE arrived while the file
 	 * was open for writing here, so another (remote) entity is modifying it
 	 * concurrently.  Reads and writes are routed direct (shared-lock
-	 * parallel dio) until the notifies stop, the last writer closes, or the
-	 * inode is mmapped.  See fuse_reverse_inval_inode()/fuse_file_io_open().
+	 * parallel dio) until the last writer closes or the inode is mmapped.
+	 * See fuse_reverse_inval_inode()/fuse_file_io_open().
 	 */
 	FUSE_I_FORCE_DIO,
-	/*
-	 * The page cache has been emptied under that latch, so no cached write
-	 * from before it can still be in flight.  Set once per latch by
-	 * fuse_force_dio_drain(), cleared wherever FUSE_I_FORCE_DIO is.
-	 */
-	FUSE_I_FORCE_DIO_DRAINED,
 };
 
 struct fuse_conn;
