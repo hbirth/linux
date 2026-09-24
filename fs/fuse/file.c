@@ -2335,110 +2335,22 @@ static loff_t fuse_write_chunk_size(struct fuse_conn *fc)
 static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from);
 
 /*
- * Does a write published before @r still cover a byte of it?  Only the
- * entries ahead of it on the list: the oldest of an overlapping set waits
- * for nobody, so the list always drains.  Caller holds fuse_inode.wr_lock.
- */
-static bool fuse_write_range_blocked_locked(struct fuse_inode *fi,
-					    struct fuse_write_range *r)
-{
-	struct fuse_write_range *o;
-
-	list_for_each_entry(o, &fi->wr_ranges, list) {
-		if (o == r)
-			return false;
-		if (o->start <= r->end && r->start <= o->end)
-			return true;
-	}
-
-	return false;
-}
-
-/* fuse_write_range_blocked_locked() taking the lock itself */
-static bool fuse_write_range_blocked(struct fuse_inode *fi,
-				     struct fuse_write_range *r)
-{
-	bool blocked;
-
-	spin_lock(&fi->wr_lock);
-	blocked = fuse_write_range_blocked_locked(fi, r);
-	spin_unlock(&fi->wr_lock);
-
-	return blocked;
-}
-
-/**
- * fuse_write_range_lock - hold a write's bytes against the other writers
- * @fi: the fuse inode
- * @r: caller-owned storage, live until fuse_write_range_unlock()
- * @pos: first byte the write covers
- * @count: how many bytes it covers
- *
- * Writers sharing the inode rwsem are serialised by the folio lock alone,
- * which lets two of them over the same bytes interleave a folio at a time.
- * write(2) is atomic against another write(2), so hold the bytes for as
- * long as the copy takes.  Writers on disjoint bytes, which is what the
- * shared lock is for, never wait here.
- *
- * Not a DLM object: the grant over these bytes is the node's and orders
- * this client against the cluster, not the tasks against each other.  No
- * revoke path takes this, so it may be held across a folio lock, a
- * read-modify-write and a grant request alike.
- */
-static void fuse_write_range_lock(struct fuse_inode *fi,
-				  struct fuse_write_range *r, loff_t pos,
-				  size_t count)
-{
-	r->start = pos;
-	r->end = pos + count - 1;
-
-	spin_lock(&fi->wr_lock);
-	/*
-	 * Published before the wait and at the tail, so a write arriving
-	 * later waits for this one and an overlapping set runs in the order
-	 * it arrived.
-	 */
-	list_add_tail(&r->list, &fi->wr_ranges);
-	while (fuse_write_range_blocked_locked(fi, r)) {
-		spin_unlock(&fi->wr_lock);
-		wait_event(fi->wr_wq, !fuse_write_range_blocked(fi, r));
-		spin_lock(&fi->wr_lock);
-	}
-	spin_unlock(&fi->wr_lock);
-}
-
-/**
- * fuse_write_range_unlock - release the bytes fuse_write_range_lock() held
- * @fi: the fuse inode
- * @r: the entry published there
- */
-static void fuse_write_range_unlock(struct fuse_inode *fi,
-				    struct fuse_write_range *r)
-{
-	spin_lock(&fi->wr_lock);
-	list_del(&r->list);
-	spin_unlock(&fi->wr_lock);
-
-	wake_up_all(&fi->wr_wq);
-}
-
-/*
  * @return true if an exclusive inode lock is needed for a cached (buffered)
  * write.
  *
  * Buffered writes normally hold the inode rwsem exclusively, serialising all
- * writers even on disjoint ranges.  The iomap writeback path under DLM is the
- * exception: i_size is committed under fi->lock rather than the inode rwsem
- * (see fuse_cache_write_iter()), and the bytes of two writers are held apart
- * by fuse_write_range_lock() instead, so disjoint writers (MPI-IO / IOR) may
- * share the lock.  Mirrors fuse_dio_wr_exclusive_lock() for the direct path.
+ * writers even on disjoint ranges.  The DLM-serialised iomap writeback path is
+ * the exception: the DLM already excludes cluster-wide, and i_size is committed
+ * under fi->lock rather than the inode rwsem (see fuse_cache_write_iter()), so
+ * disjoint writers (MPI-IO / IOR) may share the lock.  Mirrors
+ * fuse_dio_wr_exclusive_lock() for the direct path.
  */
 static bool fuse_cache_wr_exclusive_lock(struct kiocb *iocb, bool writeback)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
 	struct fuse_conn *fc = get_fuse_conn(inode);
 
-	/* Only the iomap writeback path under DLM relaxes the lock. */
+	/* Only the DLM-serialised iomap writeback path relaxes the lock. */
 	if (!fc->dlm || !writeback)
 		return true;
 
@@ -2538,11 +2450,9 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	ssize_t err, count;
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
-	struct fuse_write_range wr;
 	bool writeback = false;
 	bool stream = false;
 	bool through = false;
-	bool claimed = false;
 	bool exclusive;
 
 	if (fuse_inode_force_dio(inode))
@@ -2624,10 +2534,9 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	 *
 	 * The request may find that the server has no DLM at all and clear
 	 * fc->dlm, so pick the lock mode after it rather than before.  The
-	 * grant says nothing about the writers on this node: it is the
-	 * node's, and every task here writes under the same one.  What keeps
-	 * two of them off each other's bytes is fuse_write_range_lock()
-	 * below.
+	 * relaxed shared lock is only sound under DLM, which is what keeps
+	 * disjoint writers off each other's bytes; chosen too early, they
+	 * would share the inode lock with nothing serialising them.
 	 *
 	 * O_DIRECT takes no DLM lock at all, here or anywhere: it dirties
 	 * no page cache, so there is nothing for a grant to cover, and its
@@ -2694,17 +2603,6 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		if (err)
 			return err;
 		return fuse_direct_write_iter(iocb, from);
-	}
-
-	/*
-	 * Hold these bytes against the writers sharing the inode lock.
-	 * Taken after the re-route above, which returns without passing
-	 * the release below, and after generic_write_checks() has settled
-	 * what the write covers.
-	 */
-	if (!exclusive) {
-		fuse_write_range_lock(fi, &wr, iocb->ki_pos, count);
-		claimed = true;
 	}
 
 	/*
@@ -2872,8 +2770,6 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		written = fuse_perform_write(iocb, from);
 	}
 out:
-	if (claimed)
-		fuse_write_range_unlock(fi, &wr);
 	fuse_cache_wr_unlock(inode, exclusive);
 	if (written > 0) {
 		/* The buffered branch above, the only one leaving folios dirty */
@@ -5190,9 +5086,6 @@ void fuse_init_file_inode(struct inode *inode, unsigned int flags)
 	fi->notify_stamp = jiffies;
 	fi->notify_interval_ewma = FUSE_NOTIFY_EWMA_SEED << FUSE_NOTIFY_EWMA_SHIFT;
 	atomic_set(&fi->size_extenders, 0);
-	spin_lock_init(&fi->wr_lock);
-	INIT_LIST_HEAD(&fi->wr_ranges);
-	init_waitqueue_head(&fi->wr_wq);
 	fi->write_size_ewma = 0;
 	fi->write_stream_run = 0;
 	fi->write_stream_next = 0;
