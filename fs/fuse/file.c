@@ -1285,8 +1285,12 @@ static int fuse_read_folio(struct file *file, struct folio *folio)
 	 * closes the first.  Both fail into fuse_read_folio_retry().
 	 */
 	if (fc->dlm && fc->writeback_cache) {
-		pinned = fuse_dlm_trypin_held(fi, &pin, pos, len,
-					      FUSE_PAGE_LOCK_READ);
+		pinned = fuse_dlm_trypin(fi, &pin, pos, len);
+		if (pinned && !fuse_dlm_lock_is_held(fi, pos, len,
+						     FUSE_PAGE_LOCK_READ)) {
+			fuse_dlm_unpin(fi);
+			pinned = false;
+		}
 		if (!pinned)
 			return fuse_read_folio_retry(file, folio, pos, len);
 	}
@@ -1462,9 +1466,13 @@ static int fuse_send_readpages(struct fuse_io_args *ia, struct file *file,
 	 * again with no folio held.
 	 */
 	if (fm->fc->dlm && fm->fc->writeback_cache) {
-		if (!fuse_dlm_trypin_held_span(fi, &ia->read.dlm_pin, pos,
-					       count, FUSE_PAGE_LOCK_READ))
+		if (!fuse_dlm_trypin_span(fi, &ia->read.dlm_pin, pos, count))
 			goto uncovered;
+		if (!fuse_dlm_lock_is_held(fi, pos, count,
+					   FUSE_PAGE_LOCK_READ)) {
+			fuse_dlm_unpin_span(fi, &ia->read.dlm_pin);
+			goto uncovered;
+		}
 		ia->read.dlm_fi = fi;
 	}
 
@@ -3868,6 +3876,8 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 	}
 
 	if (fc->dlm && fc->writeback_cache) {
+		int err;
+
 		/*
 		 * The revoke handler flushing the range it is taking
 		 * away.  That lock is still this client's until the
@@ -3900,8 +3910,13 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 		 * leaves the run in the same place for the same reason.  A
 		 * revoke elsewhere in the file does not refuse it.
 		 */
-		pinned = fuse_dlm_trypin_held(fi, &pin, pos, len,
-					      FUSE_PAGE_LOCK_WRITE);
+		pinned = fuse_dlm_trypin(fi, &pin, pos, len);
+		if (pinned && !fuse_dlm_lock_is_held(fi, pos, len,
+						     FUSE_PAGE_LOCK_WRITE)) {
+			fuse_dlm_unpin(fi);
+			pinned = false;
+		}
+
 		if (!pinned) {
 			fuse_writeback_redirty(fc, data, wpc->wbc, folio, len);
 			if (data->regrant_end <= data->regrant_start) {
@@ -3928,14 +3943,19 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 		}
 
 		/*
-		 * Confirmed and pinned, so the run goes out under a grant
-		 * that is held now and cannot be taken away before the
-		 * bytes are under writeback: a revoke of the range drains
-		 * the pins before fuse_dlm_unlock_range() removes anything,
-		 * and one already draining would have refused the pin.
-		 * Asking the record a second time here would answer the
-		 * same and cost a round of the cache lock per folio.
+		 * Held, and pinned so it stays held: this walks the record
+		 * and sends nothing.  It stays a call rather than the check
+		 * above so a grant that arrives between them is still used.
 		 */
+		err = fuse_dlm_regrant_range(data->ff, inode, pos,
+					     pos + len - 1);
+		if (err < 0 && err != -ENOSYS) {
+			fuse_writeback_redirty(fc, data, wpc->wbc, folio, len);
+			fuse_dlm_unpin(fi);
+			if (!data->defer_err)
+				data->defer_err = err;
+			return len;
+		}
 	}
 queue:
 
