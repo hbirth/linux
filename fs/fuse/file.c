@@ -3220,20 +3220,12 @@ static bool fuse_force_dio_active(struct inode *inode)
 	if (!fuse_inode_force_dio(inode))
 		return false;
 
-	/*
-	 * Unlocked, and both may change under this: a writer that appears after
-	 * the check leaves the latch cleared, one that goes leaves it on until
-	 * the next IO looks again.  Neither is wrong, and the list is re-read
-	 * under fi->lock before anything is cleared.
-	 */
 	if (!time_after(jiffies,
-			READ_ONCE(fi->notify_stamp) + FUSE_NOTIFY_DIO_COLD) ||
-	    !list_empty_careful(&fi->write_files))
+			READ_ONCE(fi->notify_stamp) + FUSE_NOTIFY_DIO_COLD))
 		return true;
 
 	spin_lock(&fi->lock);
 	if (test_bit(FUSE_I_FORCE_DIO, &fi->state) &&
-	    list_empty(&fi->write_files) &&
 	    time_after(jiffies, fi->notify_stamp + FUSE_NOTIFY_DIO_COLD)) {
 		clear_bit(FUSE_I_FORCE_DIO, &fi->state);
 		clear_bit(FUSE_I_FORCE_DIO_DRAINED, &fi->state);
