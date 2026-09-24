@@ -1006,15 +1006,6 @@ static void fuse_notify_invalidate_range(struct inode *inode, pgoff_t start,
 	loff_t last;
 	bool frozen;
 
-	/*
-	 * Writeback state exists on regular files only, in the union arm
-	 * fuse_init_file_inode() sets up.
-	 */
-	if (!S_ISREG(inode->i_mode)) {
-		invalidate_inode_pages2_range(inode->i_mapping, start, end);
-		return;
-	}
-
 	spin_lock(&fi->lock);
 	frozen = fi->writectr < 0;
 	spin_unlock(&fi->lock);
@@ -1249,20 +1240,11 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			if (latched)
 				pr_info_ratelimited("FUSE: inode %llu latched to direct IO on invalidation notify storm\n",
 						    nodeid);
-		} else if (!S_ISREG(inode->i_mode)) {
-			/*
-			 * No grant record and no writeback: both live in the
-			 * union arm only fuse_init_file_inode() sets up, which
-			 * a directory shares with its readdir cache.  Drop the
-			 * range the way the base does.
-			 */
-			invalidate_inode_pages2_range(inode->i_mapping,
-						      pg_start, pg_end);
 		} else {
 			/*
-			 * No record on this inode (DAX, backing, or no DLM),
-			 * so assume the range can hold unwritten data and drop
-			 * it as before.
+			 * No record on this inode (DAX, backing, non-regular,
+			 * or no DLM), so assume the range can hold unwritten
+			 * data and drop it as before.
 			 */
 			if (fc->dlm && fc->writeback_cache)
 				fuse_dlm_revoke_inval_range(fi, offset, len);
