@@ -426,20 +426,15 @@ static void fuse_prepare_release(struct fuse_inode *fi, struct fuse_file *ff,
 
 	/* Inode is NULL on error path of fuse_create_open() */
 	if (likely(fi)) {
-		bool writer;
-
 		spin_lock(&fi->lock);
-		writer = !list_empty(&ff->write_entry);
 		list_del(&ff->write_entry);
 		/*
 		 * Leave forced direct IO mode once the last writer is gone: with
 		 * no local writer left there is no cached-write contention with
 		 * the remote modifier that triggered the switch.  Restore
-		 * FUSE_I_CACHE_IO_MODE for any frozen cached opens.  A reader
-		 * closing ends nothing: an inode latched with no writer at all
-		 * leaves on the cold check in fuse_force_dio_active().
+		 * FUSE_I_CACHE_IO_MODE for any frozen cached opens.
 		 */
-		if (writer && test_bit(FUSE_I_FORCE_DIO, &fi->state) &&
+		if (test_bit(FUSE_I_FORCE_DIO, &fi->state) &&
 		    list_empty(&fi->write_files)) {
 			clear_bit(FUSE_I_FORCE_DIO, &fi->state);
 			if (fi->iocachectr > 0)
@@ -1487,14 +1482,6 @@ static void fuse_readahead(struct readahead_control *rac)
 	struct folio *folio = NULL;
 
 	if (fuse_is_bad(inode))
-		return;
-
-	/*
-	 * A latched inode keeps no page cache, and this window was not asked
-	 * for by a read that has to be served (madvise(), fadvise()).  Decline
-	 * it: read_pages() drops the folios of a window left unfilled.
-	 */
-	if (fuse_inode_force_dio(inode))
 		return;
 
 	/*
@@ -3093,50 +3080,6 @@ static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	return res;
 }
 
-/*
- * Whether the inode is still latched into direct IO.  The latch is set on a
- * stream of invalidation notifies and has to come off when the stream stops,
- * or an inode that was hot once stays uncached for as long as it is open.  The
- * average behind the latch is folded on arrival and cannot age on its own, so
- * the age of the last notify is the clock.
- *
- * Cleared here the way the mmap revert clears it: no inode lock, none is held
- * at the top of the IO paths, and the drop is server-free because everything
- * cached under the latch is clean.
- */
-static bool fuse_force_dio_active(struct inode *inode)
-{
-	struct fuse_inode *fi = get_fuse_inode(inode);
-	bool cleared = false;
-
-	if (!fuse_inode_force_dio(inode))
-		return false;
-
-	if (!time_after(jiffies,
-			READ_ONCE(fi->notify_stamp) + FUSE_NOTIFY_DIO_COLD))
-		return true;
-
-	spin_lock(&fi->lock);
-	if (test_bit(FUSE_I_FORCE_DIO, &fi->state) &&
-	    time_after(jiffies, fi->notify_stamp + FUSE_NOTIFY_DIO_COLD)) {
-		clear_bit(FUSE_I_FORCE_DIO, &fi->state);
-		if (fi->iocachectr > 0)
-			set_bit(FUSE_I_CACHE_IO_MODE, &fi->state);
-		cleared = true;
-	}
-	spin_unlock(&fi->lock);
-
-	/*
-	 * Whatever a read racing the latch left behind, so it cannot be served
-	 * once caching resumes.  Another caller may have cleared the latch
-	 * first, or set it again since; the bit decides, not this one's work.
-	 */
-	if (cleared)
-		invalidate_inode_pages2(inode->i_mapping);
-
-	return fuse_inode_force_dio(inode);
-}
-
 static ssize_t fuse_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct file *file = iocb->ki_filp;
@@ -3150,7 +3093,7 @@ static ssize_t fuse_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		return fuse_dax_read_iter(iocb, to);
 
 	/* FOPEN_DIRECT_IO overrides FOPEN_PASSTHROUGH */
-	if ((ff->open_flags & FOPEN_DIRECT_IO) || fuse_force_dio_active(inode))
+	if ((ff->open_flags & FOPEN_DIRECT_IO) || fuse_inode_force_dio(inode))
 		return fuse_direct_read_iter(iocb, to);
 	else if (fuse_file_passthrough(ff))
 		return fuse_passthrough_read_iter(iocb, to);
@@ -3171,7 +3114,7 @@ static ssize_t fuse_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		return fuse_dax_write_iter(iocb, from);
 
 	/* FOPEN_DIRECT_IO overrides FOPEN_PASSTHROUGH */
-	if ((ff->open_flags & FOPEN_DIRECT_IO) || fuse_force_dio_active(inode))
+	if ((ff->open_flags & FOPEN_DIRECT_IO) || fuse_inode_force_dio(inode))
 		return fuse_direct_write_iter(iocb, from);
 	else if (fuse_file_passthrough(ff))
 		return fuse_passthrough_write_iter(iocb, from);
@@ -3188,13 +3131,6 @@ static ssize_t fuse_splice_read(struct file *in, loff_t *ppos,
 	/* FOPEN_DIRECT_IO overrides FOPEN_PASSTHROUGH */
 	if (fuse_file_passthrough(ff) && !(ff->open_flags & FOPEN_DIRECT_IO))
 		return fuse_passthrough_splice_read(in, ppos, pipe, len, flags);
-
-	/*
-	 * Latched: copy through ->read_iter, which reads direct, rather than
-	 * fill a page cache this inode is not allowed to keep.
-	 */
-	if (fuse_force_dio_active(file_inode(in)))
-		return copy_splice_read(in, ppos, pipe, len, flags);
 
 	fuse_read_grant(in, *ppos, len);
 

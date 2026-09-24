@@ -911,15 +911,6 @@ static void fuse_invalidate_inode_entry(struct inode *inode)
 }
 
 /*
- * Someone here has the file open and would use its page cache: a writeback
- * writer, or any open in caching mode.  Must be called under fi->lock.
- */
-static bool fuse_inode_has_opener(struct fuse_inode *fi)
-{
-	return !list_empty(&fi->write_files) || fi->iocachectr > 0;
-}
-
-/*
  * Fold one FUSE_NOTIFY_INVAL_INODE data invalidation into the per-inode
  * moving average of the notification inter-arrival interval and report whether
  * the file is now "hot" -- notifications are arriving fast enough (short
@@ -927,8 +918,8 @@ static bool fuse_inode_has_opener(struct fuse_inode *fi)
  * average is an EWMA (weight 1/2^FUSE_NOTIFY_EWMA_SHIFT); the sample is clamped
  * to FUSE_NOTIFY_EWMA_SEED so a notify after a long idle only cools the average
  * and cannot overflow the accumulator.  Must be called under fi->lock; called
- * for every data invalidation so the average stays current even while the file
- * is not open here.
+ * for every data invalidation so the average stays current even while no local
+ * writer is open.
  */
 static bool fuse_notify_inval_hot(struct fuse_inode *fi)
 {
@@ -1127,12 +1118,8 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 		 *    under fi->lock, updated for every data invalidation) of
 		 *    how fast these arrive; when they come in a rapid stream
 		 *    -- a remote writer repeatedly invalidating -- and the
-		 *    inode is open here, latch it into direct IO until the
-		 *    stream stops, the last writer closes, or it is mmapped.
-		 *    A reader-only inode is latched too: what it caches
-		 *    between two invalidations is dropped again before it can
-		 *    be read twice, so the cache costs the folios and the read
-		 *    grants behind them and returns nothing.
+		 *    inode is also open for writing here, latch it into
+		 *    direct IO until the last writer closes or it is mmapped.
 		 *    When latched, drop the whole mapping rather than just
 		 *    the notified range, or dirty folios outside it would be
 		 *    invisible to the forced direct reads (stale read / lost
@@ -1141,7 +1128,8 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 		 *    up to date either way, so enabling it at runtime takes
 		 *    effect on the next storm rather than after a warm-up.
 		 *    Clearing it at runtime stops new latches but lets
-		 *    already-latched inodes run out on the usual exits.
+		 *    already-latched inodes run out on the usual exits (last
+		 *    writer closes, or mmap).
 		 *
 		 * The average and the latch exist only for writeback+dlm
 		 * regular files; elsewhere there is no record to consult and
@@ -1154,12 +1142,12 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			  !fuse_inode_backing(fi);
 
 		if (tracked) {
-			bool hot, has_opener, latched = false;
+			bool hot, has_writer, latched = false;
 			bool may_be_dirty, has_pages;
 
 			spin_lock(&fi->lock);
 			hot = fuse_notify_inval_hot(fi);
-			has_opener = fuse_inode_has_opener(fi);
+			has_writer = !list_empty(&fi->write_files);
 			spin_unlock(&fi->lock);
 
 			/*
@@ -1205,11 +1193,11 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 
 			fuse_dlm_revoke_inval_range(fi, offset, len);
 
-			if (enable_notify_dio && hot && has_opener &&
+			if (enable_notify_dio && hot && has_writer &&
 			    !mapping_mapped(inode->i_mapping) &&
 			    !fuse_inode_force_dio(inode)) {
 				spin_lock(&fi->lock);
-				if (fuse_inode_has_opener(fi)) {
+				if (!list_empty(&fi->write_files)) {
 					set_bit(FUSE_I_FORCE_DIO, &fi->state);
 					latched = true;
 				}
@@ -1219,23 +1207,17 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			/*
 			 * Latched: drop the whole mapping (dirty folios
 			 * outside the notified range would be invisible to
-			 * the forced direct reads), laundering only what the
-			 * mapping says may be dirty, which for an inode
-			 * latched with no writer is nothing.  Otherwise just
-			 * the notified range, and only if anything is cached
-			 * there.
+			 * the forced direct reads), and the record says
+			 * nothing about the rest of the file, so launder.
+			 * Otherwise just the notified range, and only if
+			 * anything is cached there.
 			 */
-			if (fuse_inode_force_dio(inode)) {
-				bool dirty;
-
-				dirty = filemap_range_needs_writeback(
-						inode->i_mapping, 0, LLONG_MAX);
-				fuse_notify_invalidate_range(inode, 0, -1, dirty);
-			} else if (has_pages) {
+			if (fuse_inode_force_dio(inode))
+				fuse_notify_invalidate_range(inode, 0, -1, true);
+			else if (has_pages)
 				fuse_notify_invalidate_range(inode, pg_start,
 							     pg_end,
 							     may_be_dirty);
-			}
 
 			if (latched)
 				pr_info_ratelimited("FUSE: inode %llu latched to direct IO on invalidation notify storm\n",

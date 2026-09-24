@@ -187,18 +187,15 @@ struct dlm_locked_area
  * Force-DIO switch trigger: an exponentially weighted moving average of the
  * interval (in jiffies) between FUSE_NOTIFY_INVAL_INODE data invalidations for
  * a file.  When the average spacing falls below FUSE_NOTIFY_DIO_INTERVAL -- a
- * remote writer streaming invalidations -- and the file is open here, it is
- * latched into direct IO.  These are the source-level (not externally tunable)
- * parameters of the heuristic: EWMA weight 1/2^SHIFT, seeded and capped at SEED
- * so it takes a short burst rather than a single notify to trip.
- *
- * The average is folded on arrival and cannot age on its own, so what takes the
- * latch off again is the last invalidation reaching FUSE_NOTIFY_DIO_COLD old.
+ * remote writer streaming invalidations -- and the file is open for writing
+ * here, it is latched into direct IO.  These are the source-level (not
+ * externally tunable) parameters of the heuristic: EWMA weight 1/2^SHIFT,
+ * seeded and capped at SEED so it takes a short burst rather than a single
+ * notify to trip.
  */
 #define FUSE_NOTIFY_DIO_INTERVAL	max_t(unsigned long, HZ / 10, 1)
 #define FUSE_NOTIFY_EWMA_SHIFT		2
 #define FUSE_NOTIFY_EWMA_SEED		(2 * FUSE_NOTIFY_DIO_INTERVAL)
-#define FUSE_NOTIFY_DIO_COLD		(8 * FUSE_NOTIFY_DIO_INTERVAL)
 
 /*
  * Streamed file trigger: the same buffer size arriving over and over is a
@@ -290,11 +287,9 @@ struct fuse_inode {
 			 * the last one, notify_interval_ewma the EWMA of the
 			 * inter-arrival interval (jiffies, scaled by
 			 * 2^FUSE_NOTIFY_EWMA_SHIFT).  A rapid stream (short
-			 * average interval) with the file open here latches
-			 * the inode into direct IO, and notify_stamp going
-			 * stale takes it out again.  Protected by fi->lock;
-			 * regular files only (shares the readdir-cache union
-			 * arm).
+			 * average interval) with a local writer latches the
+			 * inode into direct IO.  Protected by fi->lock; regular
+			 * files only (shares the readdir-cache union arm).
 			 */
 			unsigned long notify_stamp;
 			unsigned int notify_interval_ewma;
