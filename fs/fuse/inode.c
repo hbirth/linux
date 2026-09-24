@@ -2104,12 +2104,17 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 				 * tracks a folio a block at a time and fills
 				 * any block the write covers only part of.
 				 * Writeback then sends whole dirty blocks.
-				 * Everything the DLM path grants, pins and
-				 * revokes is a whole page, and the two have
-				 * only ever been the same size here.
+				 * Both of those are cut at the page in this
+				 * filesystem: fuse_dlm_buffered_write() sends
+				 * the unaligned edges of a write to the server
+				 * itself so that no partly written block is
+				 * ever dirtied, and it cuts at PAGE_SIZE.
 				 *
-				 * Refuse the connection rather than run at a
-				 * granularity nothing has been tried at.
+				 * A block that is not a page breaks that, and
+				 * quietly: the fill would come back for the
+				 * remainder of an edge block, from a server
+				 * that need not hold anything there.  Refuse
+				 * the connection instead.
 				 */
 				if (fc->blkbits != PAGE_SHIFT) {
 					pr_err("fuse: writeback cache needs a page sized block, got %u\n",
