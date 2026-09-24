@@ -202,20 +202,19 @@ struct dlm_locked_area
 
 /*
  * Streamed file trigger: the same buffer size arriving over and over is a
- * task working through a file a record at a time.  The sizes are folded
+ * writer working through a file a record at a time.  The sizes are folded
  * into an exponentially weighted moving average (weight 1/2^SHIFT, kept
- * shifted), and a run of FUSE_STREAM_RUN requests within
- * 1/2^FUSE_STREAM_TOL_SHIFT of it says the task is still on it.  The sample
+ * shifted), and a run of FUSE_WRITE_STREAM_RUN writes within
+ * 1/2^FUSE_WRITE_TOL_SHIFT of it says the writer is still on it.  The sample
  * is capped to keep the shifted accumulator inside an unsigned int.
  */
-#define FUSE_STREAM_EWMA_SHIFT		2
-#define FUSE_STREAM_TOL_SHIFT		3
-#define FUSE_STREAM_RUN			4
-#define FUSE_STREAM_EWMA_MAX		(UINT_MAX >> FUSE_STREAM_EWMA_SHIFT)
+#define FUSE_WRITE_EWMA_SHIFT		2
+#define FUSE_WRITE_TOL_SHIFT		3
+#define FUSE_WRITE_STREAM_RUN		4
+#define FUSE_WRITE_EWMA_MAX		(UINT_MAX >> FUSE_WRITE_EWMA_SHIFT)
 
-/* Under this size the copy through the page cache is not worth avoiding */
+/* Under this size the copy into the page cache is not worth avoiding */
 #define FUSE_WRITE_STREAM_MIN		(64 * 1024)
-#define FUSE_READ_STREAM_MIN		(10 * PAGE_SIZE)
 
 /** FUSE inode */
 struct fuse_inode {
@@ -324,19 +323,13 @@ struct fuse_inode {
 			 * next write has to land to carry the run of
 			 * positions on, and write_stream_start the first
 			 * byte of that run no writeback kick has covered.
-			 * read_size_ewma and read_stream_run are the same
-			 * average over the reads that could be cached, kept
-			 * apart so a write phase and a read phase over one
-			 * file do not fold into each other.
 			 * Hints only, read and written without a lock; see
-			 * fuse_stream_update().
+			 * fuse_write_stream_update().
 			 */
 			unsigned int write_size_ewma;
 			unsigned int write_stream_run;
 			loff_t write_stream_next;
 			loff_t write_stream_start;
-			unsigned int read_size_ewma;
-			unsigned int read_stream_run;
 		};
 
 		/* readdir cache (directory only) */

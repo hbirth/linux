@@ -1588,50 +1588,11 @@ static void fuse_readahead(struct readahead_control *rac)
 
 static ssize_t fuse_direct_read_iter(struct kiocb *iocb, struct iov_iter *to);
 
-/*
- * Fold one request size into a moving average of this inode's sizes and
- * report whether the file is being streamed: the same buffer size arriving
- * FUSE_STREAM_RUN times over, which is what a task working through a file a
- * record at a time looks like from here.  A size outside the tolerance around
- * the average starts the run again from that size, so a task changing its
- * record is followed rather than averaged with what it did before.
- *
- * The average is per inode rather than per handle, so a stream stays one
- * stream across reopens and across the handles of a shared file, whose users
- * are streaming it together without any one of them being sequential.
- *
- * A hint only, read and written without the inode lock, which the DLM path
- * holds shared: callers landing on it together cost a misread run, not
- * correctness.
- */
-static bool fuse_stream_update(unsigned int *ewma, unsigned int *run,
-			       size_t len)
-{
-	unsigned int sample = min_t(size_t, len, FUSE_STREAM_EWMA_MAX);
-	unsigned int avg = *ewma >> FUSE_STREAM_EWMA_SHIFT;
-
-	if (*run && abs_diff(sample, avg) <= avg >> FUSE_STREAM_TOL_SHIFT) {
-		/* E += sample - (E >> SHIFT); avg = E >> SHIFT */
-		*ewma += sample - avg;
-		if (*run < FUSE_STREAM_RUN)
-			(*run)++;
-	} else {
-		*ewma = sample << FUSE_STREAM_EWMA_SHIFT;
-		*run = 1;
-	}
-
-	return *run >= FUSE_STREAM_RUN;
-}
-
 static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct file *file = iocb->ki_filp;
-	struct address_space *mapping = file->f_mapping;
-	struct inode *inode = mapping->host;
+	struct inode *inode = file->f_mapping->host;
 	struct fuse_conn *fc = get_fuse_conn(inode);
-	struct fuse_inode *fi = get_fuse_inode(inode);
-	size_t count = iov_iter_count(to);
-	bool stream = false;
 	ssize_t res;
 
 	/*
@@ -1640,51 +1601,11 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	 * i_size is up to date).
 	 */
 	if (fc->auto_inval_data ||
-	    (iocb->ki_pos + count > i_size_read(inode))) {
+	    (iocb->ki_pos + iov_iter_count(to) > i_size_read(inode))) {
 		int err;
 		err = fuse_update_attributes(inode, iocb->ki_filp, STATX_SIZE);
 		if (err)
 			return err;
-	}
-
-	/*
-	 * Every read that could be cached feeds the size average, streamed or
-	 * not: a reader changing its record has to be seen as well.  O_DIRECT
-	 * is not one of them, and an empty read says nothing about a record.
-	 */
-	if (count && !(iocb->ki_flags & IOCB_DIRECT))
-		stream = fuse_stream_update(&fi->read_size_ewma,
-					    &fi->read_stream_run, count);
-
-	/*
-	 * A streamed read of FUSE_READ_STREAM_MIN or more is served into the
-	 * caller's own pages instead.  Cached, the bytes are copied twice on
-	 * their way out of the server, into the folios and out of them into
-	 * the caller, and the folios are dropped unread; served from here they
-	 * are copied once, and the grant the fill would have run under is not
-	 * asked for at all.  What that gives up is the readahead of the next
-	 * record, not the wait for this one.
-	 *
-	 * Not on a mapped file, which keeps its page cache either way, and not
-	 * for IOCB_NOWAIT, which the direct read has no way to honour.  A
-	 * caller that gets EAGAIN out of the cached path here comes back
-	 * without the flag and takes this branch on the retry.
-	 *
-	 * Dirty folios over the range have to reach the server first: a direct
-	 * read does not look in the page cache, and fuse_direct_io() flushes
-	 * only for a file opened FOPEN_DIRECT_IO.
-	 */
-	if (stream && count >= FUSE_READ_STREAM_MIN &&
-	    !(iocb->ki_flags & IOCB_NOWAIT) && !mapping_mapped(mapping)) {
-		loff_t end = iocb->ki_pos + count - 1;
-
-		if (filemap_range_needs_writeback(mapping, iocb->ki_pos, end)) {
-			res = filemap_write_and_wait_range(mapping, iocb->ki_pos,
-							   end);
-			if (res)
-				return res;
-		}
-		return fuse_direct_read_iter(iocb, to);
 	}
 
 	/*
@@ -1693,7 +1614,7 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	 * cache, and what it reads is the server's to order.
 	 */
 	if (!(iocb->ki_flags & IOCB_DIRECT))
-		fuse_read_grant(file, iocb->ki_pos, count);
+		fuse_read_grant(file, iocb->ki_pos, iov_iter_count(to));
 
 	/*
 	 * A NOTIFY invalidate racing this read drops the folios it
@@ -1705,16 +1626,16 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	 * grant taken here is what they confirm.
 	 */
 	if (fuse_inode_force_dio(inode)) {
+		size_t count = iov_iter_count(to);
+
 		/*
 		 * A write that passed this same check just before the latch
 		 * took hold dirtied the page cache after the notify dropped
 		 * it, and a direct read does not look there.  Send it first.
 		 */
 		if (count) {
-			loff_t end = iocb->ki_pos + count - 1;
-
-			res = filemap_write_and_wait_range(mapping,
-							   iocb->ki_pos, end);
+			res = filemap_write_and_wait_range(inode->i_mapping,
+					iocb->ki_pos, iocb->ki_pos + count - 1);
 			if (res)
 				return res;
 		}
@@ -2443,6 +2364,42 @@ static int fuse_cache_wr_dlm_lock(struct file *file, loff_t pos, size_t len)
 }
 
 /*
+ * Fold one buffered write size into the moving average of this inode's write
+ * sizes and report whether the file is being streamed: the same buffer size
+ * arriving FUSE_WRITE_STREAM_RUN times over, which is what a writer working
+ * through a file a record at a time looks like from here.  A size outside the
+ * tolerance around the average starts the run again from that size, so a
+ * writer changing its record is followed rather than averaged with what it
+ * did before.
+ *
+ * The average is per inode rather than per handle, so a stream stays one
+ * stream across reopens and across the handles of a shared file, whose
+ * writers are streaming it together without any one of them being sequential.
+ *
+ * A hint only, read and written without the inode lock, which the DLM path
+ * holds shared: writers landing on it together cost a misread run, not
+ * correctness.
+ */
+static bool fuse_write_stream_update(struct fuse_inode *fi, size_t len)
+{
+	unsigned int sample = min_t(size_t, len, FUSE_WRITE_EWMA_MAX);
+	unsigned int avg = fi->write_size_ewma >> FUSE_WRITE_EWMA_SHIFT;
+
+	if (fi->write_stream_run &&
+	    abs_diff(sample, avg) <= avg >> FUSE_WRITE_TOL_SHIFT) {
+		/* E += sample - (E >> SHIFT); avg = E >> SHIFT */
+		fi->write_size_ewma += sample - avg;
+		if (fi->write_stream_run < FUSE_WRITE_STREAM_RUN)
+			fi->write_stream_run++;
+	} else {
+		fi->write_size_ewma = sample << FUSE_WRITE_EWMA_SHIFT;
+		fi->write_stream_run = 1;
+	}
+
+	return fi->write_stream_run >= FUSE_WRITE_STREAM_RUN;
+}
+
+/*
  * Start non-integrity writeback on the aligned chunks a streamed file has
  * left behind.
  *
@@ -2560,9 +2517,7 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	 * with.
 	 */
 	if (writeback && !(iocb->ki_flags & IOCB_DIRECT))
-		stream = fuse_stream_update(&fi->write_size_ewma,
-					    &fi->write_stream_run,
-					    iov_iter_count(from));
+		stream = fuse_write_stream_update(fi, iov_iter_count(from));
 
 	/*
 	 * A streamed write of FUSE_WRITE_STREAM_MIN or more is sent from here
@@ -5069,8 +5024,6 @@ void fuse_init_file_inode(struct inode *inode, unsigned int flags)
 	fi->write_stream_run = 0;
 	fi->write_stream_next = 0;
 	fi->write_stream_start = 0;
-	fi->read_size_ewma = 0;
-	fi->read_stream_run = 0;
 
 	if (IS_ENABLED(CONFIG_FUSE_DAX))
 		fuse_dax_inode_init(inode, flags);
