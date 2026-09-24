@@ -3535,15 +3535,7 @@ static bool fuse_writepage_need_send(struct fuse_conn *fc,
 		pgoff_t page_index = pos >> PAGE_SHIFT;
 
 		if (wbc && !(page_index % fc->alignment_pages)) {
-			/*
-			 * A cyclic pass leaves range_end at zero and runs to
-			 * the end of the mapping instead, so reading it there
-			 * makes every aligned index its own request.
-			 */
-			pgoff_t end_page_index = wbc->range_cyclic ?
-				(pgoff_t) -1 :
-				(pgoff_t) ((wbc->range_end + PAGE_SIZE - 1) >>
-					   PAGE_SHIFT);
+			pgoff_t end_page_index = (wbc->range_end + PAGE_SIZE - 1) >> PAGE_SHIFT;
 
 			/* we are at a point where we would write aligned
 			 * check if we potentially could reach the next alignment */
