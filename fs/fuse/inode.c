@@ -481,6 +481,31 @@ u32 fuse_get_cache_mask(struct inode *inode)
 	return STATX_MTIME | STATX_CTIME | STATX_SIZE;
 }
 
+/*
+ * Whether a cached time stamp stays over the one the server reported.
+ *
+ * Without dlm the kernel owns the stamps of a writeback inode and the
+ * server's are ignored.  With dlm the cached stamp is a placeholder set by
+ * the local writes the server has not seen, not an authority: a later stamp
+ * from the server records a modification the server did see, our own
+ * earlier writeback or another node's write, and stat() has to report it.
+ * The dirty data stamps again when it is written back.
+ */
+static bool fuse_cached_time_wins(struct fuse_conn *fc,
+				  const struct timespec64 *cached,
+				  u64 sec, u32 nsec, bool have)
+{
+	struct timespec64 reported = {
+		.tv_sec = sec,
+		.tv_nsec = min_t(u32, nsec, NSEC_PER_SEC - 1),
+	};
+
+	if (!fc->dlm || !have)
+		return true;
+
+	return timespec64_compare(cached, &reported) >= 0;
+}
+
 static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr,
 				     struct fuse_statx *sx, u64 attr_valid,
 				     u64 attr_version, u64 evict_ctr)
@@ -491,6 +516,8 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 	loff_t oldsize;
 	struct timespec64 old_mtime;
 	bool have_size = !sx || (sx->mask & STATX_SIZE);
+	bool have_mtime = !sx || (sx->mask & STATX_MTIME);
+	bool have_ctime = !sx || (sx->mask & STATX_CTIME);
 
 	spin_lock(&fi->lock);
 
@@ -504,12 +531,26 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 		attr->size = i_size_read(inode);
 
 	if (cache_mask & STATX_MTIME) {
-		attr->mtime = inode_get_mtime_sec(inode);
-		attr->mtimensec = inode_get_mtime_nsec(inode);
+		struct timespec64 cached = inode_get_mtime(inode);
+
+		if (fuse_cached_time_wins(fc, &cached, attr->mtime,
+					  attr->mtimensec, have_mtime)) {
+			attr->mtime = cached.tv_sec;
+			attr->mtimensec = cached.tv_nsec;
+		} else {
+			cache_mask &= ~STATX_MTIME;
+		}
 	}
 	if (cache_mask & STATX_CTIME) {
-		attr->ctime = inode_get_ctime_sec(inode);
-		attr->ctimensec = inode_get_ctime_nsec(inode);
+		struct timespec64 cached = inode_get_ctime(inode);
+
+		if (fuse_cached_time_wins(fc, &cached, attr->ctime,
+					  attr->ctimensec, have_ctime)) {
+			attr->ctime = cached.tv_sec;
+			attr->ctimensec = cached.tv_nsec;
+		} else {
+			cache_mask &= ~STATX_CTIME;
+		}
 	}
 
 	if ((attr_version != 0 && fi->attr_version > attr_version) ||
@@ -540,7 +581,6 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 	 */
 	if (!cache_mask && S_ISREG(inode->i_mode)) {
 		bool inval = false;
-		bool have_mtime = !sx || (sx->mask & STATX_MTIME);
 
 		if (have_size && oldsize != attr->size) {
 			truncate_pagecache(inode, attr->size);
