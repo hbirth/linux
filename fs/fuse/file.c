@@ -1973,6 +1973,11 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 	exclusive = fuse_cache_wr_exclusive_lock(iocb, writeback);
 
+	if (exclusive)
+		inode_lock(inode);
+	else
+		inode_lock_shared(inode);
+
 	/*
 	 * Reserve the IO range lock in INIT state over the byte range this
 	 * write will (provisionally) touch before requesting the DLM write
@@ -2007,6 +2012,8 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		err = fuse_cache_wr_dlm_lock(file, dlm_pos, dlm_len, NULL);
 		if (err) {
 			fuse_range_lock_release(fi, &rlock);
+			fuse_cache_wr_unlock(inode, exclusive);
+
 			return err;
 		}
 
@@ -2025,11 +2032,6 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		 */
 		exclusive = fuse_cache_wr_exclusive_lock(iocb, writeback);
 	}
-
-	if (exclusive)
-		inode_lock(inode);
-	else
-		inode_lock_shared(inode);
 
 	/* note that this small code dup will save us a lot of headache later
 	 * when appends are done concurrently without using parallel direct writes */
