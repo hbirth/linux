@@ -134,6 +134,22 @@ struct dlm_locked_area
 #define FUSE_NOTIFY_EWMA_SHIFT		2
 #define FUSE_NOTIFY_EWMA_SEED		(2 * FUSE_NOTIFY_DIO_INTERVAL)
 
+/*
+ * Streamed file trigger: the same buffer size arriving over and over is a
+ * writer working through a file a record at a time.  The sizes are folded into
+ * a rolling mean (an exponentially weighted moving average of weight 1/2^SHIFT,
+ * kept shifted), and a run of FUSE_WRITE_STREAM_RUN writes landing within
+ * 1/2^FUSE_WRITE_TOL_SHIFT of it says the writer is still on it.  The sample is
+ * capped to keep the shifted accumulator inside an unsigned int.
+ */
+#define FUSE_WRITE_EWMA_SHIFT		2
+#define FUSE_WRITE_TOL_SHIFT		3
+#define FUSE_WRITE_STREAM_RUN		4
+#define FUSE_WRITE_EWMA_MAX		(UINT_MAX >> FUSE_WRITE_EWMA_SHIFT)
+
+/* Under this size a record is not worth a write of its own */
+#define FUSE_WRITE_STREAM_MIN		(64 * 1024)
+
 /** FUSE inode */
 struct fuse_inode {
 	/** Inode data */
@@ -223,6 +239,19 @@ struct fuse_inode {
 			 * range being invalidated.
 			 */
 			struct fuse_range_lock_tree io_range_lock;
+
+			/*
+			 * The buffered writes of this inode, whatever
+			 * handle they come through: write_size_ewma is
+			 * the rolling mean of their sizes and
+			 * write_stream_run how many of the last ones
+			 * arrived at that size, which together say the
+			 * file is being streamed.  Hints only, read and
+			 * written without a lock; see
+			 * fuse_write_stream_update().
+			 */
+			unsigned int write_size_ewma;
+			unsigned int write_stream_run;
 		};
 
 		/* readdir cache (directory only) */
@@ -1582,6 +1611,9 @@ int fuse_do_open(struct fuse_mount *fm, u64 nodeid, struct file *file,
 
 /** CUSE pass fuse_direct_io() a file which f_mapping->host is not from FUSE */
 #define FUSE_DIO_CUSE  (1 << 1)
+
+/** Caller holds i_rwsem shared, so writepages must not be frozen */
+#define FUSE_DIO_SHARED (1 << 2)
 
 ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
 		       loff_t *ppos, int flags);
