@@ -1321,9 +1321,11 @@ static void fuse_attr_to_statx(struct fuse_attr *attr, struct fuse_statx *sx, ui
  * @param sx_mask request mask send to to fuse-server
  * @param mandatory_sx_mask subset of (or complete) sx_mask that the server
  * has to fulfill
+ * @param srv_size where to report the size the server sent, or NULL
 */
 static int fuse_do_statx(struct inode *inode, struct file *file,
-			 struct kstat *stat, u32 sx_mask, u32 mandatory_sx_mask)
+			 struct kstat *stat, u32 sx_mask, u32 mandatory_sx_mask,
+			 loff_t *srv_size)
 {
 	int err;
 	struct fuse_attr attr;
@@ -1386,6 +1388,14 @@ static int fuse_do_statx(struct inode *inode, struct file *file,
 		return -EIO;
 	}
 
+	/*
+	 * Before fuse_change_attributes(), which rewrites attr->size to the
+	 * cached one where that wins and drops the reply where an update
+	 * landing since has overtaken it.
+	 */
+	if (srv_size && (sx->mask & STATX_SIZE))
+		*srv_size = sx->size;
+
 	fuse_statx_to_attr(&outarg.stat, &attr);
 	if (sx->mask & STATX_BASIC_STATS) {
 		fuse_change_attributes(inode, &attr, &outarg.stat,
@@ -1404,7 +1414,7 @@ static int fuse_do_statx(struct inode *inode, struct file *file,
 }
 
 static int fuse_do_getattr(struct inode *inode, struct kstat *stat,
-			   struct file *file)
+			   struct file *file, loff_t *srv_size)
 {
 	int err;
 	struct fuse_getattr_in inarg;
@@ -1432,6 +1442,9 @@ static int fuse_do_getattr(struct inode *inode, struct kstat *stat,
 			fuse_make_bad(inode);
 			err = -EIO;
 		} else {
+			/* before fuse_change_attributes() rewrites it */
+			if (srv_size)
+				*srv_size = outarg.attr.size;
 			fuse_change_attributes(inode, &outarg.attr, NULL,
 					       ATTR_TIMEOUT(&outarg),
 					       attr_version);
@@ -1444,7 +1457,7 @@ static int fuse_do_getattr(struct inode *inode, struct kstat *stat,
 
 static int fuse_update_get_attr(struct inode *inode, struct file *file,
 				struct kstat *stat, u32 request_mask,
-				unsigned int flags)
+				unsigned int flags, loff_t *srv_size)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_conn *fc = get_fuse_conn(inode);
@@ -1476,14 +1489,15 @@ retry:
 		forget_all_cached_acls(inode);
 		if (!fc->no_statx) {
 			err = fuse_do_statx(inode, file, stat, sx_mask,
-					    mandatory_sx_mask);
+					    mandatory_sx_mask, srv_size);
 			if (err == -ENOSYS) {
 				fc->no_statx = 1;
 				err = 0;
 				goto retry;
 			}
 		} else {
-			err = fuse_do_getattr(inode, stat, file);
+			err = fuse_do_getattr(inode, stat, file,
+					      srv_size);
 		}
 	} else if (stat) {
 		generic_fillattr(&nop_mnt_idmap, sx_mask, inode, stat);
@@ -1500,7 +1514,41 @@ retry:
 
 int fuse_update_attributes(struct inode *inode, struct file *file, u32 mask)
 {
-	return fuse_update_get_attr(inode, file, NULL, mask, 0);
+	return fuse_update_get_attr(inode, file, NULL, mask, 0, NULL);
+}
+
+/*
+ * How often to ask when the answer does not reach the inode.  A drop needs an
+ * update landing while the request is out and does not repeat.
+ */
+#define FUSE_ATTR_SYNC_TRIES	3
+
+/*
+ * Ask the server, whatever the attribute cache says, and for the size keep
+ * asking while what it reports is beyond i_size.  fuse_change_attributes()
+ * returns without applying a reply that an update landing since has
+ * overtaken, so the call returning is no statement about i_size, and a caller
+ * resolving EOF against it reports EOF over bytes that are there.  A size the
+ * cache wins with is reported below i_size and ends the loop.
+ *
+ * For attributes the timeout cannot speak for, see fuse_size_needs_server().
+ */
+int fuse_update_attributes_sync(struct inode *inode, struct file *file,
+				u32 mask)
+{
+	unsigned int tries = FUSE_ATTR_SYNC_TRIES;
+	loff_t size;
+	int err;
+
+	do {
+		size = 0;
+		err = fuse_update_get_attr(inode, file, NULL, mask,
+					   AT_STATX_FORCE_SYNC, &size);
+		if (err || !(mask & STATX_SIZE))
+			return err;
+	} while (size > i_size_read(inode) && --tries);
+
+	return 0;
 }
 
 int fuse_reverse_inval_entry(struct fuse_conn *fc, u64 parent_nodeid,
@@ -1645,7 +1693,7 @@ static int fuse_perm_getattr(struct inode *inode, int mask, int perm_mask)
 
 	forget_all_cached_acls(inode);
 	return fuse_update_get_attr(inode, NULL, NULL, perm_mask,
-				    AT_STATX_FORCE_SYNC);
+				    AT_STATX_FORCE_SYNC, NULL);
 }
 
 /*
@@ -2258,7 +2306,7 @@ static int fuse_setattr(struct mnt_idmap *idmap, struct dentry *entry,
 			 * ia_mode calculation may have used stale i_mode.
 			 * Refresh and recalculate.
 			 */
-			ret = fuse_do_getattr(inode, NULL, file);
+			ret = fuse_do_getattr(inode, NULL, file, NULL);
 			if (ret)
 				return ret;
 
@@ -2315,7 +2363,8 @@ static int fuse_getattr(struct mnt_idmap *idmap,
 		return -EACCES;
 	}
 
-	return fuse_update_get_attr(inode, NULL, stat, request_mask, flags);
+	return fuse_update_get_attr(inode, NULL, stat, request_mask, flags,
+				    NULL);
 }
 
 static const struct inode_operations fuse_dir_inode_operations = {
