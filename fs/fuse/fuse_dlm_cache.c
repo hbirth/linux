@@ -890,6 +890,7 @@ static bool fuse_range_try_mark_ready(struct fuse_range_lock_tree *tree,
  *
  * Blocks until [start, end] can be reserved in the requested mode
  * without conflicting with any other currently held, overlapping range.
+ * The range is rounded out to whole pages; see fuse_dlm_cache.h.
  */
 void fuse_range_lock_acquire_init(struct fuse_inode *inode,
 				 struct fuse_range_lock *lock,
@@ -898,8 +899,8 @@ void fuse_range_lock_acquire_init(struct fuse_inode *inode,
 {
 	struct fuse_range_lock_tree *tree = &inode->io_range_lock;
 
-	lock->start = start;
-	lock->end = end;
+	lock->start = round_down(start, PAGE_SIZE);
+	lock->end = end | (PAGE_SIZE - 1);
 	lock->mode = mode;
 
 	wait_event(tree->waitq, fuse_range_try_lock_init(tree, lock));
@@ -951,7 +952,8 @@ void fuse_range_lock_mark_init(struct fuse_inode *inode,
  *
  * Blocks until [start, end] can be locked in the requested mode without
  * conflicting with any other currently held READY, overlapping range.
- * An overlapping range still in INIT state does not block this.
+ * An overlapping range still in INIT state does not block this.  The
+ * range is rounded out to whole pages; see fuse_dlm_cache.h.
  */
 void fuse_range_lock_acquire_ready(struct fuse_inode *inode,
 				  struct fuse_range_lock *lock,
@@ -960,8 +962,8 @@ void fuse_range_lock_acquire_ready(struct fuse_inode *inode,
 {
 	struct fuse_range_lock_tree *tree = &inode->io_range_lock;
 
-	lock->start = start;
-	lock->end = end;
+	lock->start = round_down(start, PAGE_SIZE);
+	lock->end = end | (PAGE_SIZE - 1);
 	lock->mode = mode;
 
 	wait_event(tree->waitq, fuse_range_try_lock_ready(tree, lock));
