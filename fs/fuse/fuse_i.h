@@ -1384,16 +1384,13 @@ struct fuse_io_args {
 			struct fuse_read_in in;
 			u64 attr_ver;
 			/*
-			 * The fill published before the request, and the
-			 * inode to commit it on.  @dlm_fi is NULL when
-			 * there is nothing to commit against (no DLM, no
-			 * writeback cache).  Nothing is held across the
-			 * request: a revoke marks @dlm_fill rather than
-			 * waiting for the reply, and fuse_readpages_end()
-			 * caches nothing that was marked.  See
-			 * fuse_dlm_fill_begin().
+			 * The grant the folios are filled under, held
+			 * from the request until the reply has filled
+			 * them; see fuse_send_readpages().  @dlm_fi is
+			 * the inode to drop it on, and NULL when there
+			 * is no pin to drop.
 			 */
-			struct fuse_dlm_range dlm_fill;
+			struct fuse_dlm_span dlm_pin;
 			struct fuse_inode *dlm_fi;
 		} read;
 		struct {
