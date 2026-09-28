@@ -2006,7 +2006,7 @@ static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct inode *inode = file_inode(iocb->ki_filp);
 	struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(iocb);
 	struct address_space *mapping = inode->i_mapping;
-	loff_t pos = iocb->ki_pos;
+	loff_t pos;
 	bool exclusive = false;
 	bool uncached = false;
 	ssize_t res;
@@ -2014,6 +2014,9 @@ static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	fuse_dio_lock(iocb, from, &exclusive, &uncached);
 	res = generic_write_checks(iocb, from);
 	if (res > 0) {
+		/* O_APPEND: generic_write_checks() moved ki_pos to EOF */
+		pos = iocb->ki_pos;
+
 		if (!is_sync_kiocb(iocb) && iocb->ki_flags & IOCB_DIRECT) {
 			res = fuse_direct_IO(iocb, from);
 		} else {
