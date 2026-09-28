@@ -2644,7 +2644,8 @@ static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(iocb);
 
 			res = fuse_direct_io(&io, from, &iocb->ki_pos,
-					     FUSE_DIO_WRITE);
+					     FUSE_DIO_WRITE |
+					     (exclusive ? 0 : FUSE_DIO_SHARED));
 			fuse_write_update_attr(inode, iocb->ki_pos, res);
 		}
 		if (res > 0 && mapping->nrpages) {
@@ -3885,7 +3886,8 @@ __fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter, bool exclusive)
 	}
 
 	if (iov_iter_rw(iter) == WRITE) {
-		ret = fuse_direct_io(io, iter, &pos, FUSE_DIO_WRITE);
+		ret = fuse_direct_io(io, iter, &pos, FUSE_DIO_WRITE |
+				     (exclusive ? 0 : FUSE_DIO_SHARED));
 		fuse_invalidate_attr_mask(inode, FUSE_STATX_MODSIZE);
 	} else {
 		ret = __fuse_direct_read(io, iter, &pos);
