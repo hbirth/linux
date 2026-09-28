@@ -3759,6 +3759,13 @@ static struct fuse_file *__fuse_write_file_get(struct fuse_inode *fi)
 	return ff;
 }
 
+static struct fuse_file *fuse_write_file_get(struct fuse_inode *fi)
+{
+	struct fuse_file *ff = __fuse_write_file_get(fi);
+	WARN_ON(!ff);
+	return ff;
+}
+
 int fuse_write_inode(struct inode *inode, struct writeback_control *wbc)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
@@ -3889,7 +3896,7 @@ static int fuse_writepage_locked(struct folio *folio)
 	bool pinned = false;
 	int error = -EIO;
 
-	ff = __fuse_write_file_get(fi);
+	ff = fuse_write_file_get(fi);
 	if (!ff)
 		goto err;
 
@@ -4101,15 +4108,9 @@ static int fuse_writepages_fill(struct folio *folio,
 	bool pinned = false;
 	int err;
 
-	/*
-	 * Every folio that cannot be sent is deferred the same way, whatever
-	 * the reason: it goes back on the dirty list here, under the folio
-	 * lock it was handed over with, and an error is kept for
-	 * fuse_writepages() to report rather than returned here, which would
-	 * end the pass with the rest of the mapping unwritten.
-	 */
 	if (!data->ff) {
-		data->ff = __fuse_write_file_get(fi);
+		err = -EIO;
+		data->ff = fuse_write_file_get(fi);
 		if (!data->ff) {
 			/*
 			 * No file left open for writing, which the last
@@ -4120,9 +4121,6 @@ static int fuse_writepages_fill(struct folio *folio,
 			 * rather than drop a write fsync reported done.
 			 */
 			fuse_writeback_redirty(fc, wbc, folio);
-			if (!data->defer_err)
-				data->defer_err = -EIO;
-			err = 0;
 			goto out_unlock;
 		}
 	}
@@ -4223,9 +4221,6 @@ static int fuse_writepages_fill(struct folio *folio,
 		if (err < 0 && err != -ENOSYS) {
 			fuse_writeback_redirty(fc, wbc, folio);
 			fuse_dlm_unpin(fi);
-			if (!data->defer_err)
-				data->defer_err = err;
-			err = 0;
 			goto out_unlock;
 		}
 		err = 0;
@@ -4238,14 +4233,12 @@ queue:
 	}
 
 	if (data->wpa == NULL) {
+		err = -ENOMEM;
 		wpa = fuse_writepage_args_setup(folio, data->ff);
 		if (!wpa) {
 			fuse_writeback_redirty(fc, wbc, folio);
 			if (pinned)
 				fuse_dlm_unpin(fi);
-			if (!data->defer_err)
-				data->defer_err = -ENOMEM;
-			err = 0;
 			goto out_unlock;
 		}
 		fuse_file_get(wpa->ia.ff);
