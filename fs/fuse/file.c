@@ -1299,8 +1299,12 @@ static int fuse_read_folio(struct file *file, struct folio *folio)
 		struct fuse_dlm_span pin;
 		bool pinned;
 
-		pinned = fuse_dlm_trypin_held(fi, &pin, pos, len,
-					      FUSE_PAGE_LOCK_READ);
+		pinned = fuse_dlm_trypin(fi, &pin, pos, len);
+		if (pinned && !fuse_dlm_lock_is_held(fi, pos, len,
+						     FUSE_PAGE_LOCK_READ)) {
+			fuse_dlm_unpin(fi);
+			pinned = false;
+		}
 		if (!pinned)
 			return fuse_read_folio_retry(file, folio, pos, len);
 
@@ -1448,9 +1452,13 @@ static int fuse_send_readpages(struct fuse_io_args *ia, struct file *file)
 	if (fm->fc->dlm && fm->fc->writeback_cache) {
 		struct fuse_dlm_span pin;
 
-		if (!fuse_dlm_trypin_held(fi, &pin, pos, count,
-					  FUSE_PAGE_LOCK_READ))
+		if (!fuse_dlm_trypin(fi, &pin, pos, count))
 			goto uncovered;
+		if (!fuse_dlm_lock_is_held(fi, pos, count,
+					   FUSE_PAGE_LOCK_READ)) {
+			fuse_dlm_unpin(fi);
+			goto uncovered;
+		}
 		/* Published under the pin, so no revoke can slip in front */
 		fuse_dlm_fill_begin(fi, &ia->read.dlm_fill, pos, count);
 		fuse_dlm_unpin(fi);
@@ -4003,8 +4011,12 @@ static int fuse_writepage_locked(struct folio *folio)
 		if (fuse_in_notify_range(pos, len))
 			goto queue;
 
-		pinned = fuse_dlm_trypin_held(fi, &pin, pos, len,
-					      FUSE_PAGE_LOCK_WRITE);
+		pinned = fuse_dlm_trypin(fi, &pin, pos, len);
+		if (pinned && !fuse_dlm_lock_is_held(fi, pos, len,
+						     FUSE_PAGE_LOCK_WRITE)) {
+			fuse_dlm_unpin(fi);
+			pinned = false;
+		}
 
 		if (!pinned) {
 			fuse_file_put(ff, false);
@@ -4257,8 +4269,12 @@ static int fuse_writepages_fill(struct folio *folio,
 		 * leaves the folio in the same place for the same reason.  A
 		 * revoke elsewhere in the file does not refuse it.
 		 */
-		pinned = fuse_dlm_trypin_held(fi, &pin, pos, len,
-					      FUSE_PAGE_LOCK_WRITE);
+		pinned = fuse_dlm_trypin(fi, &pin, pos, len);
+		if (pinned && !fuse_dlm_lock_is_held(fi, pos, len,
+						     FUSE_PAGE_LOCK_WRITE)) {
+			fuse_dlm_unpin(fi);
+			pinned = false;
+		}
 
 		if (!pinned) {
 			fuse_writeback_redirty(fc, wbc, folio);
