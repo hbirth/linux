@@ -17,10 +17,8 @@
  *    fuse_dlm_request_commit() drops such a grant instead of recording
  *    it.
  *
- *  - READ or WRITE, in cache->ranges.  The only states
- *    fuse_dlm_range_is_locked() reports as covered; the mode is not a
- *    separate field, since a range is either not held or held in one
- *    definite mode.
+ *  - GRANTED, in cache->ranges.  The only state
+ *    fuse_dlm_range_is_locked() reports as covered.
  *
  * In-flight requests are kept off the tree so the state is consulted
  * only where a request is retired, not by every tree walker.
@@ -40,15 +38,13 @@ enum fuse_dlm_range_state {
 	FUSE_DLM_RANGE_REQUESTED,
 	/* Revoked while in flight; the grant must not be recorded */
 	FUSE_DLM_RANGE_REVOKED,
-	/* Granted shared, in cache->ranges */
-	FUSE_DLM_RANGE_READ,
-	/* Granted exclusive, in cache->ranges */
-	FUSE_DLM_RANGE_WRITE,
+	/* Recorded grant, in cache->ranges */
+	FUSE_DLM_RANGE_GRANTED,
 };
 
 /* A range of pages with a lock */
 struct fuse_dlm_range {
-	/* Interval tree node; only linked once granted */
+	/* Interval tree node; only linked while GRANTED */
 	struct rb_node rb;
 	/* Start page offset (inclusive) */
 	uint64_t start;
@@ -56,35 +52,17 @@ struct fuse_dlm_range {
 	uint64_t end;
 	/* Subtree end value for interval tree */
 	uint64_t __subtree_end;
-	/* Lifecycle and, once granted, the mode; see the enum above */
+	/* Lock mode, as FUSE_PCACHE_LK_READ / FUSE_PCACHE_LK_WRITE */
+	enum fuse_page_lock_mode mode;
+	/* Lifecycle state; see enum fuse_dlm_range_state */
 	enum fuse_dlm_range_state state;
 	/* Temporary list entry for operations, and the cache->pending link */
 	struct list_head list;
 };
 
-/* The state a grant in @mode is recorded under */
-static inline enum fuse_dlm_range_state
-fuse_dlm_granted_state(enum fuse_page_lock_mode mode)
-{
-	return mode == FUSE_PAGE_LOCK_READ ? FUSE_DLM_RANGE_READ :
-					     FUSE_DLM_RANGE_WRITE;
-}
-
-/**
- * fuse_dlm_state_satisfies - is a range in @held usable for @want
- * @held: the state of a range recorded in the tree
- * @want: FUSE_DLM_RANGE_READ or FUSE_DLM_RANGE_WRITE
- *
- * A WRITE grant is exclusive and so covers a READ request; nothing else
- * substitutes for anything.  The two pending states never appear in the
- * tree and cover nothing.
- */
-static inline bool fuse_dlm_state_satisfies(enum fuse_dlm_range_state held,
-					    enum fuse_dlm_range_state want)
-{
-	return held == want ||
-	       (held == FUSE_DLM_RANGE_WRITE && want == FUSE_DLM_RANGE_READ);
-}
+/* Lock modes for FUSE page cache */
+#define FUSE_PCACHE_LK_READ 1 /* Shared read lock */
+#define FUSE_PCACHE_LK_WRITE 2 /* Exclusive write lock */
 
 /* Interval tree definitions for page ranges */
 static inline uint64_t fuse_dlm_range_start(struct fuse_dlm_range *range)
@@ -232,8 +210,8 @@ static void fuse_dlm_try_merge(struct fuse_dlm_cache *cache, uint64_t start,
 					struct fuse_dlm_range, rb);
 		}
 
-		/* Try to merge with next range if adjacent and same state */
-		if (next && range->state == next->state &&
+		/* Try to merge with next range if adjacent and same mode */
+		if (next && range->mode == next->mode &&
 		    range->end + 1 == next->start) {
 			/* Merge ranges: re-insert so __subtree_end is updated */
 			fuse_page_it_remove(next, &cache->ranges);
@@ -265,8 +243,8 @@ static void fuse_dlm_try_merge(struct fuse_dlm_cache *cache, uint64_t start,
  * - READ locks are compatible with existing WRITE locks (downgrade not needed)
  * - WRITE locks need to upgrade existing READ locks
  *
- * Everything inserted here is READ or WRITE: this runs only after the
- * server has answered.
+ * Everything inserted here is FUSE_DLM_RANGE_GRANTED: this runs only
+ * after the server has answered.
  *
  * Caller holds the cache lock for write.
  *
@@ -278,7 +256,7 @@ static int fuse_dlm_lock_range_locked(struct fuse_inode *inode, uint64_t start,
 {
 	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
 	struct fuse_dlm_range *range, *new_range, *next;
-	enum fuse_dlm_range_state want;
+	int lock_mode;
 	bool covered_to_end = false;
 	int ret = 0;
 	LIST_HEAD(to_lock);
@@ -288,8 +266,9 @@ static int fuse_dlm_lock_range_locked(struct fuse_inode *inode, uint64_t start,
 	if (!cache || start > end)
 		return -EINVAL;
 
-	/* The state this grant records */
-	want = fuse_dlm_granted_state(mode);
+	/* Convert to lock mode */
+	lock_mode = (mode == FUSE_PAGE_LOCK_READ) ? FUSE_PCACHE_LK_READ :
+						    FUSE_PCACHE_LK_WRITE;
 
 	/* Find all ranges that overlap with [start, end] */
 	range = fuse_page_it_iter_first(&cache->ranges, start, end);
@@ -298,8 +277,8 @@ static int fuse_dlm_lock_range_locked(struct fuse_inode *inode, uint64_t start,
 		next = fuse_page_it_iter_next(range, start, end);
 
 		/* Check lock compatibility */
-		if (want == FUSE_DLM_RANGE_WRITE &&
-		    range->state != FUSE_DLM_RANGE_WRITE) {
+		if (lock_mode == FUSE_PCACHE_LK_WRITE &&
+		    lock_mode != range->mode) {
 			/* we own the lock but have to update it. */
 			list_add_tail(&range->list, &to_upgrade);
 		}
@@ -315,7 +294,8 @@ static int fuse_dlm_lock_range_locked(struct fuse_inode *inode, uint64_t start,
 
 			new_range->start = current_start;
 			new_range->end = range->start - 1;
-			new_range->state = want;
+			new_range->mode = lock_mode;
+			new_range->state = FUSE_DLM_RANGE_GRANTED;
 			INIT_LIST_HEAD(&new_range->list);
 
 			list_add_tail(&new_range->list, &to_lock);
@@ -341,7 +321,8 @@ static int fuse_dlm_lock_range_locked(struct fuse_inode *inode, uint64_t start,
 
 		new_range->start = current_start;
 		new_range->end = end;
-		new_range->state = want;
+		new_range->mode = lock_mode;
+		new_range->state = FUSE_DLM_RANGE_GRANTED;
 		INIT_LIST_HEAD(&new_range->list);
 
 		list_add_tail(&new_range->list, &to_lock);
@@ -350,7 +331,7 @@ static int fuse_dlm_lock_range_locked(struct fuse_inode *inode, uint64_t start,
 	/* update locks, if any lock is in this list it has the wrong mode */
 	list_for_each_entry(range, &to_upgrade, list) {
 		/* Update the lock mode */
-		range->state = want;
+		range->mode = lock_mode;
 	}
 
 	/* Add all new ranges to the tree */
@@ -375,9 +356,9 @@ out_free:
 
 	/* Restore original lock modes for any partially upgraded locks */
 	list_for_each_entry(range, &to_upgrade, list) {
-		if (want == FUSE_DLM_RANGE_WRITE) {
+		if (lock_mode == FUSE_PCACHE_LK_WRITE) {
 			/* We upgraded this lock but failed later, downgrade it back */
-			range->state = FUSE_DLM_RANGE_READ;
+			range->mode = FUSE_PCACHE_LK_READ;
 		}
 	}
 
@@ -403,10 +384,7 @@ int fuse_dlm_lock_range(struct fuse_inode *inode, uint64_t start,
  * @req: caller-owned storage for the request, live until commit or abort
  * @start: start page offset being requested (inclusive)
  * @end: end page offset being requested (inclusive)
- *
- * The mode is not recorded here: until the server answers the range is
- * held in neither, and the mode that reaches the tree is the one passed
- * to fuse_dlm_request_commit().
+ * @mode: FUSE_PAGE_LOCK_READ or FUSE_PAGE_LOCK_WRITE
  *
  * A FUSE_DLM_WB_LOCK reply and a NOTIFY revoke are serviced on different
  * threads, so a revoke can be processed before the grant the reply
@@ -422,13 +400,15 @@ int fuse_dlm_lock_range(struct fuse_inode *inode, uint64_t start,
  */
 void fuse_dlm_request_begin(struct fuse_inode *inode,
 			    struct fuse_dlm_range *req, uint64_t start,
-			    uint64_t end)
+			    uint64_t end, enum fuse_page_lock_mode mode)
 {
 	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
 
 	RB_CLEAR_NODE(&req->rb);
 	req->start = start;
 	req->end = end;
+	req->mode = (mode == FUSE_PAGE_LOCK_READ) ? FUSE_PCACHE_LK_READ :
+						    FUSE_PCACHE_LK_WRITE;
 	req->state = FUSE_DLM_RANGE_REQUESTED;
 
 	down_write(&cache->lock);
@@ -643,14 +623,17 @@ bool fuse_dlm_range_is_locked(struct fuse_inode *inode, uint64_t start,
 {
 	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
 	struct fuse_dlm_range *range;
-	enum fuse_dlm_range_state want;
+	int lock_mode = 0;
 	uint64_t current_start = start;
 
 	if (!cache || start > end)
 		return false;
 
-	/* The state a range has to be in to cover this request */
-	want = fuse_dlm_granted_state(mode);
+	/* Convert to lock mode if specified */
+	if (mode == FUSE_PAGE_LOCK_READ)
+		lock_mode = FUSE_PCACHE_LK_READ;
+	else if (mode == FUSE_PAGE_LOCK_WRITE)
+		lock_mode = FUSE_PCACHE_LK_WRITE;
 
 	down_read(&cache->lock);
 
@@ -667,7 +650,7 @@ bool fuse_dlm_range_is_locked(struct fuse_inode *inode, uint64_t start,
 		 * re-requesting a READ lock for a range we already hold
 		 * a WRITE lock on (e.g. read-after-write).
 		 */
-		if (!fuse_dlm_state_satisfies(range->state, want)) {
+		if (lock_mode && range->mode < lock_mode) {
 			/* Held lock is weaker than requested */
 			up_read(&cache->lock);
 			return false;
@@ -725,7 +708,7 @@ bool fuse_dlm_write_grant_exists(struct fuse_inode *fi)
 	down_read(&cache->lock);
 	for (range = fuse_dlm_find_overlapping(cache, 0, U64_MAX); range;
 	     range = fuse_page_it_iter_next(range, 0, U64_MAX)) {
-		if (range->state == FUSE_DLM_RANGE_WRITE) {
+		if (range->mode == FUSE_PCACHE_LK_WRITE) {
 			held = true;
 			break;
 		}
@@ -827,7 +810,7 @@ restart:
 	args.out_args[0].value = &outarg;
 
 	/* Publish before sending; see fuse_dlm_request_begin() */
-	fuse_dlm_request_begin(fi, &req, inarg.start, inarg.end);
+	fuse_dlm_request_begin(fi, &req, inarg.start, inarg.end, mode);
 
 	err = fuse_simple_request(fm, &args);
 	if (err) {

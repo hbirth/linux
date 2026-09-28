@@ -38,7 +38,7 @@ enum fuse_page_lock_mode { FUSE_PAGE_LOCK_READ, FUSE_PAGE_LOCK_WRITE };
 struct fuse_dlm_cache {
 	/* Lock protecting the tree and the pending list */
 	struct rw_semaphore lock;
-	/* Interval tree of granted ranges (FUSE_DLM_RANGE_READ/_WRITE) */
+	/* Interval tree of granted ranges (FUSE_DLM_RANGE_GRANTED) */
 	struct rb_root_cached ranges;
 	/*
 	 * FUSE_DLM_WB_LOCK requests in flight (REQUESTED, or REVOKED once
@@ -61,12 +61,11 @@ int fuse_dlm_lock_range(struct fuse_inode *inode, uint64_t start,
 /*
  * Publish a FUSE_DLM_WB_LOCK for [start, end] before it is sent, so a
  * revoke processed while the reply is on the wire can mark it.  @req is
- * caller-owned storage, live until the matching commit or abort.  The
- * mode is not recorded until the grant is, so only the commit takes it.
+ * caller-owned storage, live until the matching commit or abort.
  */
 void fuse_dlm_request_begin(struct fuse_inode *inode,
 			    struct fuse_dlm_range *req, uint64_t start,
-			    uint64_t end);
+			    uint64_t end, enum fuse_page_lock_mode mode);
 
 /*
  * Retire @req and record the grant [start, end] as one step under the
