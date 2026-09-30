@@ -1048,6 +1048,7 @@ struct fuse_fill_read_data {
 	struct fuse_conn *fc;
 	struct fuse_io_args *ia;
 	unsigned int nr_bytes;
+	loff_t covered;
 };
 
 /* forward declarations */
@@ -1067,6 +1068,27 @@ static int fuse_handle_readahead(struct folio *folio,
 	struct fuse_conn *fc = data->fc;
 	struct fuse_args_pages *ap;
 	unsigned int nr_pages;
+
+	/*
+	 * Fill only what a grant covers.  A folio that goes uptodate
+	 * uncovered is one the server will not invalidate when another node
+	 * writes it, and no later grant can tell it from a folio that was
+	 * covered all along.  Nothing here may ask for one, the folios of the
+	 * window are already locked, so the window stops at the first folio
+	 * no grant covers whole: iomap sends what is batched, unlocks this
+	 * folio and read_pages() drops the rest.
+	 */
+	if (fc->dlm && fc->writeback_cache &&
+	    data->covered < folio_pos(folio) + folio_size(folio)) {
+		struct fuse_inode *fi = get_fuse_inode(folio->mapping->host);
+		loff_t fpos = folio_pos(folio);
+		loff_t end = readahead_pos(rac) + readahead_length(rac);
+
+		data->covered = fuse_dlm_covered_end(fi, fpos, end - 1,
+						     FUSE_PAGE_LOCK_READ);
+		if (data->covered < fpos + folio_size(folio))
+			return -EAGAIN;
+	}
 
 	if (ia && fuse_folios_need_send(fc, pos, len, &ia->ap, data->nr_bytes,
 					false)) {
