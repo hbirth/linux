@@ -1156,8 +1156,11 @@ static void fuse_readahead(struct readahead_control *rac)
 {
 	struct inode *inode = rac->mapping->host;
 	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_inode *fi = get_fuse_inode(inode);
 	unsigned int max_pages, nr_pages;
 	struct folio *folio = NULL;
+	loff_t covered = 0;
+	bool uncovered = false;
 
 	if (fuse_is_bad(inode))
 		return;
@@ -1218,14 +1221,44 @@ static void fuse_readahead(struct readahead_control *rac)
 				break;
 			}
 
+			/*
+			 * Fill only what a grant covers.  A folio that goes
+			 * uptodate uncovered is one the server will not
+			 * invalidate when another node writes it, and no later
+			 * grant can tell it from a folio that was covered all
+			 * along.  Nothing here may ask for one, the folios of
+			 * the window are already locked, so the run stops at
+			 * the first folio no grant covers whole: it is unlocked
+			 * below and read_pages() drops the rest.
+			 */
+			if (fc->dlm && fc->writeback_cache &&
+			    covered < folio_pos(folio) + folio_size(folio)) {
+				loff_t pos = folio_pos(folio);
+				loff_t end = pos +
+					((loff_t)(cur_pages - pages) << PAGE_SHIFT);
+
+				covered = fuse_dlm_covered_end(fi, pos, end - 1,
+							       FUSE_PAGE_LOCK_READ);
+				if (covered < pos + folio_size(folio)) {
+					uncovered = true;
+					break;
+				}
+			}
+
 			ap->folios[ap->num_folios] = folio;
 			ap->descs[ap->num_folios].length = folio_size(folio);
 			ap->num_folios++;
 			pages += folio_pages;
 			folio = NULL;
 		}
+		if (!ap->num_folios) {
+			fuse_io_free(ia);
+			break;
+		}
 		fuse_send_readpages(ia, rac->file, pages << PAGE_SHIFT);
 		nr_pages -= pages;
+		if (uncovered)
+			break;
 	}
 	if (folio) {
 		folio_end_read(folio, false);
