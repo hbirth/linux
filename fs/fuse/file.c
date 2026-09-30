@@ -1094,7 +1094,9 @@ static void fuse_readahead(struct readahead_control *rac)
 {
 	struct inode *inode = rac->mapping->host;
 	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_inode *fi = get_fuse_inode(inode);
 	unsigned int i, max_pages, nr_pages = 0;
+	bool uncovered = false;
 
 	if (fuse_is_bad(inode))
 		return;
@@ -1105,6 +1107,8 @@ static void fuse_readahead(struct readahead_control *rac)
 	for (;;) {
 		struct fuse_io_args *ia;
 		struct fuse_args_pages *ap;
+		/* The last batch is taken off rac by the next __readahead_batch() */
+		loff_t pos = readahead_pos(rac) + ((loff_t)nr_pages << PAGE_SHIFT);
 
 		if (fc->num_background >= fc->congestion_threshold &&
 		    rac->ra->async_size >= readahead_count(rac))
@@ -1119,6 +1123,29 @@ static void fuse_readahead(struct readahead_control *rac)
 			nr_pages = max_pages;
 		if (nr_pages == 0)
 			break;
+
+		/*
+		 * Fill only what a grant covers.  A page that goes uptodate
+		 * uncovered is one the server will not invalidate when
+		 * another node writes it, and no later grant can tell it
+		 * from a page that was covered all along.  Nothing here may
+		 * ask for one, the pages of the window are already locked,
+		 * so the run stops at the first page no grant covers: what
+		 * is left on rac is dropped by read_pages().
+		 */
+		if (fc->dlm && fc->writeback_cache) {
+			loff_t end = pos + ((loff_t)nr_pages << PAGE_SHIFT);
+			loff_t covered = fuse_dlm_covered_end(fi, pos, end - 1,
+							      FUSE_PAGE_LOCK_READ);
+
+			if (covered < end) {
+				nr_pages = (covered - pos) >> PAGE_SHIFT;
+				uncovered = true;
+				if (nr_pages == 0)
+					break;
+			}
+		}
+
 		ia = fuse_io_alloc(NULL, nr_pages);
 		if (!ia)
 			return;
@@ -1131,6 +1158,8 @@ static void fuse_readahead(struct readahead_control *rac)
 		}
 		ap->num_pages = nr_pages;
 		fuse_send_readpages(ia, rac->file);
+		if (uncovered)
+			break;
 	}
 }
 
