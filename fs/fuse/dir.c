@@ -2113,13 +2113,9 @@ int fuse_do_setattr(struct dentry *dentry, struct iattr *attr,
 		err = write_inode_now(inode, true);
 		if (err)
 			return err;
-
-		fuse_set_nowrite(inode);
-		fuse_release_nowrite(inode);
 	}
 
 	if (is_truncate) {
-		fuse_set_nowrite(inode);
 		set_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
 		if (trust_local_cmtime && attr->ia_size != inode->i_size)
 			attr->ia_valid |= ATTR_MTIME | ATTR_CTIME;
@@ -2191,10 +2187,6 @@ int fuse_do_setattr(struct dentry *dentry, struct iattr *attr,
 	if (!is_wb || is_truncate)
 		i_size_write(inode, outarg.attr.size);
 
-	if (is_truncate) {
-		/* NOTE: this may release/reacquire fi->lock */
-		__fuse_release_nowrite(inode);
-	}
 	spin_unlock(&fi->lock);
 
 	/*
@@ -2230,9 +2222,6 @@ out:
 	return 0;
 
 error:
-	if (is_truncate)
-		fuse_release_nowrite(inode);
-
 	clear_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
 
 	if (fault_blocked)
