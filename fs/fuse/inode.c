@@ -37,14 +37,7 @@ static bool __read_mostly enable_compound;
 module_param(enable_compound, bool, 0644);
 MODULE_PARM_DESC(enable_uring, "Enable fuse compounds");
 
-/*
- * A folio wider than a block carries per-block dirty state, which
- * iomap_writeback_folio() clears whole after ->writeback_range.  A run
- * fuse defers and puts back with folio_mark_dirty() comes back dirty over
- * the whole folio, so the next pass sends blocks this client never wrote.
- * Off until there is a way to restore only the blocks that were dirty.
- */
-bool __read_mostly enable_large_folios;
+bool __read_mostly enable_large_folios = true;
 module_param(enable_large_folios, bool, 0644);
 MODULE_PARM_DESC(enable_large_folios, "Enable large folios support");
 
