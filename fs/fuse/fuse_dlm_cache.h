@@ -205,12 +205,12 @@ int fuse_dlm_unlock_range(struct fuse_inode *inode, uint64_t start,
  * until fuse_dlm_unpin(), which drops the pin this task last took.  @pin
  * is caller-owned storage, live until then.  fuse_dlm_pin() waits out a
  * revoke overlapping that range and must not be called with a folio
- * held; the wait is killable and it reports -EINTR.  Neither may be held
- * across a DLM request: that request is answered by the server the
- * revoke came from.
+ * held; fuse_dlm_trypin() never sleeps and fails instead.  Neither may
+ * be held across a DLM request: that request is answered by the server
+ * the revoke came from.
  */
-int fuse_dlm_pin(struct fuse_inode *inode, struct fuse_dlm_span *pin,
-		 loff_t offset, size_t length);
+void fuse_dlm_pin(struct fuse_inode *inode, struct fuse_dlm_span *pin,
+		  loff_t offset, size_t length);
 void fuse_dlm_unpin(struct fuse_inode *inode);
 
 /*
@@ -251,22 +251,13 @@ void fuse_dlm_revoke_end(struct fuse_inode *inode,
 bool fuse_dlm_lock_is_held(struct fuse_inode *inode, loff_t offset,
 			   size_t length, enum fuse_page_lock_mode mode);
 
-/*
- * Hold [start, end] again so writeback can send what it found revoked.
- * @wait is for a caller that must have the range: one that can put the
- * runs back passes false and takes -EAGAIN for a contended range.
- */
+/* Hold [start, end] again so writeback can send what it found revoked */
 int fuse_dlm_regrant_range(struct fuse_file *ff, struct inode *inode,
-			   uint64_t start, uint64_t end, bool wait);
+			   uint64_t start, uint64_t end);
 
 
-/*
- * This is the interface to the filesystem.  @wait keeps asking while the
- * range stays contended, which every caller that has to have the range
- * does; one that must not block for an unbounded time passes false and
- * takes -EAGAIN instead.
- */
-int fuse_get_dlm_lock(struct file *file, loff_t offset, size_t length,
-		      enum fuse_page_lock_mode mode, bool wait);
+/* This is the interface to the filesystem */
+int fuse_get_dlm_lock(struct file *file, loff_t offset,
+		      size_t length, enum fuse_page_lock_mode mode);
 
 #endif /* _FS_FUSE_DLM_CACHE_H */

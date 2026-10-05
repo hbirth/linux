@@ -268,31 +268,17 @@ static bool fuse_dlm_trypin(struct fuse_inode *inode,
  * Must not be called with a folio held: the revoke waited for here drops
  * that same page cache once it has drained.  A revoke elsewhere in the
  * file is not waited for.
- *
- * Killable, since there is no bound on it: every revoke over the range
- * republishes a fence, so a notify storm can keep a waiter here for as
- * long as it lasts, and fuse_read_folio_retry() reaches it from a fault
- * with mmap_lock held.  The callers that promise a killed task gets out
- * pass the error on.
- *
- * Return: 0 with the range pinned, -EINTR if the wait was killed.
  */
-int fuse_dlm_pin(struct fuse_inode *inode, struct fuse_dlm_span *pin,
-		 loff_t offset, size_t length)
+void fuse_dlm_pin(struct fuse_inode *inode, struct fuse_dlm_span *pin,
+		  loff_t offset, size_t length)
 {
 	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
 
 	/* A refusal leaves @pin holding the range it was refused over */
-	while (!fuse_dlm_trypin(inode, pin, offset, length)) {
-		if (wait_event_killable(cache->pin_wq,
-					!fuse_dlm_overlaps(cache,
-							   &cache->fences,
-							   pin->start,
-							   pin->end)))
-			return -EINTR;
-	}
-
-	return 0;
+	while (!fuse_dlm_trypin(inode, pin, offset, length))
+		wait_event(cache->pin_wq,
+			   !fuse_dlm_overlaps(cache, &cache->fences,
+					      pin->start, pin->end));
 }
 
 /**
@@ -1067,21 +1053,20 @@ static noinline int fuse_dlm_send_lock(struct fuse_file *ff,
  * @offset: byte offset into the file (need not be page-aligned)
  * @length: length of the region in bytes (need not be page-aligned)
  * @mode:   FUSE_PAGE_LOCK_READ or FUSE_PAGE_LOCK_WRITE
- * @wait:   keep asking while the range stays contended
  *
  * Return: 0 when the range is covered by a recorded grant on return,
  * FUSE_DLM_GRANT_UNRECORDED when the server granted the lock but
  * recording it failed (covered cluster-wide, invisible to
- * fuse_dlm_lock_is_held()), -EAGAIN when @wait is false and the range is
- * contended, a negative error code otherwise.  Callers re-validating the
- * grant must not re-request on a nonzero return or they would spin.
+ * fuse_dlm_lock_is_held()), a negative error code otherwise.  Callers
+ * re-validating the grant must not re-request on a nonzero return or
+ * they would spin.
  *
  * The common case sends nothing: the range is already covered and this
  * is the lookup and nothing else.
  */
 static int __fuse_get_dlm_lock(struct fuse_file *ff, struct inode *inode,
 			       loff_t offset, size_t length,
-			       enum fuse_page_lock_mode mode, bool wait)
+			       enum fuse_page_lock_mode mode)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	uint64_t pg_start, pg_end;
@@ -1130,26 +1115,18 @@ static int __fuse_get_dlm_lock(struct fuse_file *ff, struct inode *inode,
 		 * write reports to a caller that has no reason to expect it.
 		 * Waiting the notifications out is the better answer.  A
 		 * fatal signal still ends it, so a killed task and close()
-		 * get out, and so does the inode going bad.
-		 *
-		 * Neither is an exit a kworker has, so a caller that has
-		 * somewhere to put the work back asks not to wait and gets
-		 * -EAGAIN for the contention instead.
+		 * get out.
 		 */
-		if (!wait)
-			return -EAGAIN;
 		if (fatal_signal_pending(current))
 			return -EINTR;
-		if (fuse_is_bad(inode))
-			return -EIO;
 	}
 }
 
-int fuse_get_dlm_lock(struct file *file, loff_t offset, size_t length,
-		      enum fuse_page_lock_mode mode, bool wait)
+int fuse_get_dlm_lock(struct file *file, loff_t offset,
+		      size_t length, enum fuse_page_lock_mode mode)
 {
 	return __fuse_get_dlm_lock(file->private_data, file_inode(file),
-				   offset, length, mode, wait);
+				   offset, length, mode);
 }
 
 /**
@@ -1158,7 +1135,6 @@ int fuse_get_dlm_lock(struct file *file, loff_t offset, size_t length,
  * @inode: the inode
  * @start: start byte offset (inclusive)
  * @end: end byte offset (inclusive)
- * @wait: keep asking while the range stays contended
  *
  * Writeback holds the range again before sending a folio, since a revoke
  * may have arrived between the write and the send.  Whatever the other
@@ -1167,14 +1143,10 @@ int fuse_get_dlm_lock(struct file *file, loff_t offset, size_t length,
  *
  * A range still held is the ordinary case: the grant is found recorded
  * and nothing is sent to the server.
- *
- * Only a data integrity pass waits.  A background one runs on a kworker,
- * which has neither of the exits the wait ends on, and it has somewhere
- * to put the runs back; see fuse_iomap_writeback_submit().
  */
 int fuse_dlm_regrant_range(struct fuse_file *ff, struct inode *inode,
-			   uint64_t start, uint64_t end, bool wait)
+			   uint64_t start, uint64_t end)
 {
 	return __fuse_get_dlm_lock(ff, inode, start, end - start + 1,
-				   FUSE_PAGE_LOCK_WRITE, wait);
+				   FUSE_PAGE_LOCK_WRITE);
 }
