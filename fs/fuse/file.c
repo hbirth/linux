@@ -617,6 +617,8 @@ static void fuse_prepare_release(struct fuse_inode *fi, struct fuse_file *ff,
 	memset(ff->args, 0, sizeof(*ff->args));
 	ra->inarg.fh = ff->fh;
 	ra->inarg.flags = flags;
+	if (READ_ONCE(ff->cached_read))
+		ra->inarg.release_flags |= FUSE_RELEASE_CACHED_READ;
 	ra->args.in_numargs = 1;
 	ra->args.in_args[0].size = sizeof(struct fuse_release_in);
 	ra->args.in_args[0].value = &ra->inarg;
@@ -1698,9 +1700,11 @@ static ssize_t fuse_wb_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	 * the range lock through moves it to READY as part of processing the
 	 * reply -- as soon as the grant comes back, rather than only later,
 	 * right below.
+	 * A range the node already holds makes this a cached read, recorded
+	 * for the release.
 	 */
 	fuse_get_dlm_lock(file, iocb->ki_pos, count, FUSE_PAGE_LOCK_READ,
-			  &rlock);
+			  &rlock, true);
 
 	/*
 	 * Ensure the range lock is LOCKED before touching the page cache:
@@ -1793,8 +1797,9 @@ static ssize_t fuse_wb_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 			window -= fault_in_iov_iter_writeable(to, window);
 			if (!window)
 				break;
+			/* The first request above classified this read */
 			fuse_get_dlm_lock(file, iocb->ki_pos, remain,
-					  FUSE_PAGE_LOCK_READ, &rlock);
+					  FUSE_PAGE_LOCK_READ, &rlock, false);
 			err = fuse_range_lock_mark_locked(fi, &rlock);
 			if (err) {
 				res = err;
@@ -2218,7 +2223,7 @@ static int fuse_cache_wr_dlm_lock(struct file *file, loff_t pos, size_t len,
 				  struct fuse_range_lock *rlock)
 {
 	int err = fuse_get_dlm_lock(file, pos, len, FUSE_PAGE_LOCK_WRITE,
-				    rlock);
+				    rlock, false);
 
 	return err < 0 ? err : 0;
 }
@@ -3104,6 +3109,9 @@ static ssize_t fuse_file_write_iter_common(struct kiocb *iocb,
 	if (fuse_is_bad(inode))
 		return -EIO;
 
+	/* The release reports a user read after the handle's last write */
+	WRITE_ONCE(ff->cached_read, false);
+
 	if ((ff->open_flags & FOPEN_DIRECT_IO) || fuse_inode_force_dio(inode))
 		return fuse_direct_write_iter(iocb, from);
 
@@ -3159,6 +3167,16 @@ static ssize_t fuse_passthrough_file_write_iter(struct kiocb *iocb,
 		return fuse_direct_write_iter(iocb, from);
 
 	return fuse_passthrough_write_iter(iocb, from);
+}
+
+static ssize_t fuse_wb_splice_read(struct file *in, loff_t *ppos,
+				   struct pipe_inode_info *pipe, size_t len,
+				   unsigned int flags)
+{
+	struct fuse_file *ff = in->private_data;
+
+	WRITE_ONCE(ff->cached_read, true);
+	return filemap_splice_read(in, ppos, pipe, len, flags);
 }
 
 static ssize_t fuse_passthrough_file_splice_read(struct file *in, loff_t *ppos,
@@ -4172,7 +4190,8 @@ static vm_fault_t fuse_wb_filemap_fault(struct vm_fault *vmf)
 			 * the retried fault meets it again.  A
 			 * lost connection ends at the check above.
 			 */
-			fuse_get_dlm_lock(file, bpos, blen, mode, &rlock);
+			fuse_get_dlm_lock(file, bpos, blen, mode, &rlock,
+					  false);
 			/*
 			 * Populate the folios too, or the retried
 			 * fault's fast path would refuse the grant
@@ -4243,7 +4262,7 @@ static vm_fault_t fuse_wb_filemap_fault(struct vm_fault *vmf)
 		pgoff_t fbase;
 		int nr, i;
 
-		err = fuse_get_dlm_lock(file, bpos, blen, mode, &rlock);
+		err = fuse_get_dlm_lock(file, bpos, blen, mode, &rlock, false);
 		if (err < 0) {
 			fuse_range_lock_release(fi, &rlock);
 			return vmf_error(err);
@@ -5216,6 +5235,7 @@ fallback:
 
 	file_update_time(file_out);
 	fuse_write_update_attr(inode_out, pos_out + bytes_copied, bytes_copied);
+	WRITE_ONCE(ff_out->cached_read, false);
 
 	err = bytes_copied;
 out:
@@ -5287,7 +5307,7 @@ static const struct file_operations fuse_wb_file_operations = {
 	.lock		= fuse_file_lock,
 	.get_unmapped_area = thp_get_unmapped_area,
 	.flock		= fuse_file_flock,
-	.splice_read	= filemap_splice_read,
+	.splice_read	= fuse_wb_splice_read,
 	.splice_write	= iter_file_splice_write,
 	.unlocked_ioctl	= fuse_file_ioctl,
 	.compat_ioctl	= fuse_file_compat_ioctl,
