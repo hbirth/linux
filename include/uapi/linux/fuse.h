@@ -525,9 +525,15 @@ struct fuse_file_lock {
 
 /**
  * Release flags
+ *
+ * FUSE_RELEASE_CACHED_READ: a read(2) on this handle found its range
+ *			     already covered by a DLM grant, or a splice or
+ *			     sendfile ran on it, and no write or DLM read lock
+ *			     request followed, e.g. to stamp atime at release.
  */
 #define FUSE_RELEASE_FLUSH	(1 << 0)
 #define FUSE_RELEASE_FLOCK_UNLOCK	(1 << 1)
+#define FUSE_RELEASE_CACHED_READ	(1U << 31)
 
 /**
  * Getattr flags
