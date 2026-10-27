@@ -1195,18 +1195,15 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 		 * CW, so dirty times here mean the CW being revoked is this
 		 * node's.  Send them now, while the server still sees that CW
 		 * as granted and lets the WRITEBACK SETATTR's CW past the
-		 * pending conflicting lock. If left dirty, close or the flusher
+		 * pending conflicting lock.  If left dirty, close or the flusher
 		 * would send them after this node has re-cached PR, and the
 		 * server would have to revoke this node's own PR for it.
+		 * fuse_flush_time_update() waits for a flusher pass that is
+		 * sending them right now and keeps a failure in the mapping
+		 * for close to report.
 		 */
-		if (range_locked && whole_file &&
-		    (inode_state_read_once(inode) & (I_DIRTY_SYNC | I_DIRTY_TIME))) {
-			int serr = sync_inode_metadata(inode, 1);
-
-			if (serr)
-				pr_warn_ratelimited("FUSE: inode %llu times flush before invalidate failed: %d\n",
-						    nodeid, serr);
-		}
+		if (range_locked && whole_file)
+			fuse_flush_time_update(inode);
 
 		if (latched)
 			pr_info_ratelimited("FUSE: inode %llu latched to direct IO on invalidation notify storm\n",
