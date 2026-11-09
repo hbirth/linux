@@ -1398,7 +1398,12 @@ struct fuse_uring_cmd_req {
 			/* base address of bufpool */
 			uint64_t uaddr;
 			uint32_t len;
-			uint32_t reserved;
+			/*
+			 * size of each buffer in the pool, 0 for the ring's
+			 * max payload size. On a FUSE_URING_ZERO_COPY queue
+			 * reads and writes that do not fit are zero-copied.
+			 */
+			uint32_t buf_size;
 		} bufpool;
 
 		/*

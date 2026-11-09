@@ -548,7 +548,7 @@ static loff_t fusex_grow_size(struct inode *inode, loff_t size)
 }
 
 static ssize_t fusex_send_read(struct file *file, struct fuse_args_pages *ap,
-			       loff_t pos, size_t len)
+			       loff_t pos, size_t len, bool zero_copy)
 {
 	struct fuse_read_in inarg;
 
@@ -563,13 +563,15 @@ static ssize_t fusex_send_read(struct file *file, struct fuse_args_pages *ap,
 	ADD_OUT_ARG(ap->args, len, NULL);
 	ap->args.out_argvar = true;
 	ap->args.out_pages = true;
+	ap->args.zero_copy = zero_copy;
 
 	return fusex_inode_request(file_inode(file), &ap->args);
 }
 
 /* Writeback has no @file */
 static ssize_t fusex_send_write(struct inode *inode, struct file *file,
-				struct fuse_args_pages *ap, loff_t pos, size_t len)
+				struct fuse_args_pages *ap, loff_t pos, size_t len,
+				bool zero_copy)
 {
 	struct fuse_write_in inarg;
 	struct fuse_write_out outarg;
@@ -588,6 +590,7 @@ static ssize_t fusex_send_write(struct inode *inode, struct file *file,
 	ADD_IN_ARG_S(ap->args, &inarg);
 	ADD_IN_ARG(ap->args, len, NULL);
 	ap->args.in_pages = true;
+	ap->args.zero_copy = zero_copy;
 	ADD_OUT_ARG_S(ap->args, &outarg);
 
 	err = fusex_inode_request(inode, &ap->args);
@@ -656,6 +659,9 @@ static ssize_t fusex_direct_io(struct kiocb *iocb, struct iov_iter *iter, size_t
 	struct file *file = iocb->ki_filp;
 	struct fuse_conn *fc = get_fuse_conn(file_inode(file));
 	bool write = iov_iter_rw(iter) == WRITE;
+	/* Zero copy takes page references, kernel memory can be slab */
+	bool zero_copy = iov_iter_extract_will_pin(iter);
+	size_t max_len = zero_copy ? SIZE_MAX : fuse_uring_max_payload(fc->chan);
 	unsigned int max_pages = iov_iter_npages(iter, fc->max_pages);
 	struct fuse_args_pages ap = {};
 	size_t done = 0;
@@ -670,8 +676,11 @@ static ssize_t fusex_direct_io(struct kiocb *iocb, struct iov_iter *iter, size_t
 
 	ap.folios = folios;
 
+	if (write)
+		max_len = umin(max_len, fc->max_write);
+
 	while (done < count) {
-		size_t len = write ? umin(count - done, fc->max_write) : count - done;
+		size_t len = umin(count - done, max_len);
 		loff_t pos = iocb->ki_pos + done;
 		ssize_t got = fusex_get_pages(&ap, pages, iter, len, max_pages);
 
@@ -680,8 +689,8 @@ static ssize_t fusex_direct_io(struct kiocb *iocb, struct iov_iter *iter, size_t
 			break;
 		}
 
-		res = write ? fusex_send_write(file_inode(file), file, &ap, pos, got) :
-			      fusex_send_read(file, &ap, pos, got);
+		res = write ? fusex_send_write(file_inode(file), file, &ap, pos, got, zero_copy) :
+			      fusex_send_read(file, &ap, pos, got, zero_copy);
 		fusex_put_pages(&ap, iter, !write && res > 0);
 
 		if (res < got)
@@ -944,7 +953,7 @@ static int fusex_read_folio(struct file *file, struct folio *folio)
 	/* A racing truncate can leave the folio beyond EOF */
 	if (pos < i_size) {
 		desc.length = min_t(loff_t, folio_size(folio), i_size - pos);
-		res = fusex_send_read(file, &ap, pos, desc.length);
+		res = fusex_send_read(file, &ap, pos, desc.length, false);
 	}
 	if (res >= 0) {
 		folio_zero_segment(folio, res, folio_size(folio));
@@ -975,7 +984,7 @@ static int fusex_write_folio(struct folio *folio)
 		ssize_t res;
 
 		desc.length = min_t(loff_t, folio_size(folio), i_size - pos);
-		res = fusex_send_write(inode, NULL, &ap, pos, desc.length);
+		res = fusex_send_write(inode, NULL, &ap, pos, desc.length, false);
 		if (res != desc.length)
 			err = res < 0 ? res : -EIO;
 		if (err)
@@ -2014,8 +2023,8 @@ static int fusex_send_init(struct fs_context *fsc, struct fuse_mount *fm,
 	if (!(flags & FUSE_OVER_IO_URING))
 		return -EPROTONOSUPPORT;
 
-	/* A request has to fit the payload buffer of any ring entry */
-	max_payload = fuse_uring_max_payload(fm->fc->chan);
+	/* A read or write has to fit the payload buffer or be zero-copied */
+	max_payload = fuse_uring_max_io(fm->fc->chan);
 	if (outarg_in.max_write > max_payload)
 		return invalfc(fsc, "max_write %u exceeds the ring payload buffer %zu",
 			       outarg_in.max_write, max_payload);

@@ -111,6 +111,7 @@ static void fuse_uring_flush_bg(struct fuse_ring_queue *queue)
 static bool can_zero_copy_req(struct fuse_ring_ent *ent, struct fuse_req *req)
 {
 	struct fuse_args *args = req->args;
+	size_t len;
 
 	if (!ent->queue->zero_copy || !args->zero_copy)
 		return false;
@@ -118,7 +119,17 @@ static bool can_zero_copy_req(struct fuse_ring_ent *ent, struct fuse_req *req)
 	if (args->opcode != FUSE_READ && args->opcode != FUSE_WRITE)
 		return false;
 
-	return args->in_pages || args->out_pages;
+	if (!args->in_pages && !args->out_pages)
+		return false;
+
+	/* Only what does not fit a pool buffer */
+	if (args->in_pages)
+		len = fuse_len_args(args->in_numargs - 1,
+				    (struct fuse_arg *)&args->in_args[1]);
+	else
+		len = fuse_len_args(args->out_numargs, args->out_args);
+
+	return len > ent->queue->bufpool->buf_size;
 }
 
 static void zero_copy_unregister(struct io_uring_cmd *cmd,
@@ -298,6 +309,14 @@ size_t fuse_uring_max_payload(struct fuse_chan *fch)
 	return fch->ring->max_payload_sz;
 }
 
+/* The largest read or write: zero copy takes what does not fit a buffer */
+size_t fuse_uring_max_io(struct fuse_chan *fch)
+{
+	struct fuse_ring *ring = fch->ring;
+
+	return READ_ONCE(ring->zero_copy) ? SIZE_MAX : ring->max_payload_sz;
+}
+
 static struct fuse_ring_queue *fuse_uring_create_queue(struct fuse_ring *ring,
 						       int qid, bool zero_copy,
 						       bool fail_if_exists)
@@ -338,6 +357,18 @@ static struct fuse_ring_queue *fuse_uring_create_queue(struct fuse_ring *ring,
 		kfree(queue);
 		return fail_if_exists ? ERR_PTR(-EEXIST) : ring->queues[qid];
 	}
+
+	/* Mount limits the I/O size by fuse_uring_max_io(), any queue serves it */
+	if (ring->zero_copy_set && ring->zero_copy != zero_copy) {
+		spin_unlock(&fch->lock);
+		kfree(queue->fpq.processing);
+		kfree(queue);
+		pr_info_ratelimited("fuse: qid=%d zero copy differs from the other queues\n",
+				    qid);
+		return ERR_PTR(-EINVAL);
+	}
+	WRITE_ONCE(ring->zero_copy, zero_copy);
+	ring->zero_copy_set = true;
 
 	/*
 	 * fch->lock serializes concurrent creators for this qid.
@@ -1535,10 +1566,6 @@ static int fuse_uring_add_bufpool(struct io_uring_cmd *cmd,
 	if (!ring || qid >= ring->nr_queues || flags)
 		return -EINVAL;
 
-	/* reserved for future use, must be zero */
-	if (READ_ONCE(cmd_req->bufpool.reserved))
-		return -EINVAL;
-
 	/* Pairs with smp_store_release() in fuse_uring_create_queue() */
 	queue = smp_load_acquire(&ring->queues[qid]);
 	if (!queue)
@@ -1547,9 +1574,9 @@ static int fuse_uring_add_bufpool(struct io_uring_cmd *cmd,
 	pool_uaddr = READ_ONCE(cmd_req->bufpool.uaddr);
 	pool_len = READ_ONCE(cmd_req->bufpool.len);
 
-	/* each buffer holds the max payload size */
-	buf_size = queue->ring->max_payload_sz;
-	if (!buf_size)
+	/* by default each buffer holds the max payload size */
+	buf_size = READ_ONCE(cmd_req->bufpool.buf_size) ?: ring->max_payload_sz;
+	if (buf_size < max_t(size_t, FUSE_MIN_READ_BUFFER, PAGE_SIZE))
 		return -EINVAL;
 
 	nr_bufs = pool_len / buf_size;
@@ -1582,6 +1609,15 @@ static int fuse_uring_add_bufpool(struct io_uring_cmd *cmd,
 	if (queue->payload_mode != FUSE_PAYLOAD_UNSET) {
 		spin_unlock(&queue->lock);
 		kfree(pool);
+		return -EINVAL;
+	}
+	/* Every other request has to fit the buffer of any queue */
+	cmpxchg(&ring->max_payload_sz, 0, buf_size);
+	if (buf_size < READ_ONCE(ring->max_payload_sz)) {
+		spin_unlock(&queue->lock);
+		kfree(pool);
+		pr_info_ratelimited("fuse: bufpool buffer size %zu below the ring payload size %zu\n",
+				    buf_size, READ_ONCE(ring->max_payload_sz));
 		return -EINVAL;
 	}
 	queue->bufpool = pool;

@@ -68,5 +68,6 @@ void fuse_copy_finish(struct fuse_copy_state *cs);
 void fuse_uring_destruct(struct fuse_chan *fch);
 int fuse_uring_ring_only_init(struct fuse_chan *fch);
 size_t fuse_uring_max_payload(struct fuse_chan *fch);
+size_t fuse_uring_max_io(struct fuse_chan *fch);
 
 #endif /* _FS_FUSE_DEV_H */

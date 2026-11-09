@@ -6,6 +6,7 @@
 
 
 #include "fuse_i.h"
+#include "dev.h"
 #include <linux/pagemap.h>
 #include <linux/vmalloc.h>
 
@@ -79,7 +80,10 @@ int fuse_readdir(struct file *file, struct dir_context *ctx)
 	struct fuse_args_pages ap = {};
 	void *buf;
 	ssize_t res;
-	size_t bufsize = clamp((unsigned int) ctx->count, PAGE_SIZE, fm->fc->max_pages << PAGE_SHIFT);
+	/* fc->max_pages can exceed the payload buffer when I/O is zero-copied */
+	size_t bufsize = clamp((size_t) ctx->count, PAGE_SIZE,
+			       umin((size_t) fm->fc->max_pages << PAGE_SHIFT,
+				    fuse_uring_max_payload(fm->fc->chan)));
 	struct page **pages = fuse_readdir_alloc_buf(&ap, &bufsize);
 
 	if (!pages)

@@ -32,7 +32,7 @@ struct fuse_args {
 	bool out_argvar:1;
 	bool out_var_alloc:1;
 	bool abort_on_kill:1;
-	/* server requested io-uring zero-copy for this op */
+	/* the pages can take a reference, for io-uring zero copy */
 	bool zero_copy:1;
 	struct fuse_in_arg in_args[4];
 	struct fuse_arg out_args[2];

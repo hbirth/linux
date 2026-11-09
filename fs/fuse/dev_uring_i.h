@@ -162,6 +162,10 @@ struct fuse_ring {
 	/* maximum payload/arg size */
 	size_t max_payload_sz;
 
+	/* every queue has the zero copy setting of the first, under chan->lock */
+	bool zero_copy;
+	bool zero_copy_set;
+
 	struct fuse_ring_queue **queues;
 
 	/*
