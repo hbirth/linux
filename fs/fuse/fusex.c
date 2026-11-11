@@ -698,8 +698,15 @@ static ssize_t fusex_direct_io(struct kiocb *iocb, struct iov_iter *iter, size_t
 	while (done < count) {
 		size_t len = umin(count - done, max_len);
 		loff_t pos = iocb->ki_pos + done;
-		ssize_t got = fusex_get_pages(&ap, pages, iter, len, max_pages);
+		ssize_t got;
 
+		/* A sent request is waited out, don't send the rest */
+		if (fatal_signal_pending(current)) {
+			res = -EINTR;
+			break;
+		}
+
+		got = fusex_get_pages(&ap, pages, iter, len, max_pages);
 		if (got <= 0) {
 			res = got;
 			break;
