@@ -531,8 +531,12 @@ static void fusex_attr_changed(struct inode *inode)
 	spin_unlock(&fi->lock);
 }
 
-/* Writers share i_rwsem and a fetch doesn't take it.  Returns the old size. */
-static loff_t fusex_grow_size(struct inode *inode, loff_t size)
+/*
+ * Writers share i_rwsem and a fetch doesn't take it.  After a notify during the
+ * request the server can have truncated later: @size is no lower bound for a
+ * fetch then.  Returns the old size.
+ */
+static loff_t fusex_grow_size(struct inode *inode, loff_t size, u64 attr_version)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	loff_t old_size;
@@ -541,7 +545,10 @@ static loff_t fusex_grow_size(struct inode *inode, loff_t size)
 	old_size = inode->i_size;
 	if (size > old_size)
 		i_size_write(inode, size);
-	fi->write_end = max(fi->write_end, size);
+	if (fi->attr_version > attr_version)
+		fuse_invalidate_attr_mask(inode, STATX_SIZE);
+	else
+		fi->write_end = max(fi->write_end, size);
 	spin_unlock(&fi->lock);
 
 	return old_size;
@@ -733,8 +740,9 @@ static ssize_t fusex_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 static ssize_t fusex_direct_write(struct kiocb *iocb, struct iov_iter *from, size_t count)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
+	u64 attr_version = fuse_get_attr_version(get_fuse_conn(inode));
+	loff_t size = i_size_read(inode);
 	loff_t pos = iocb->ki_pos;
-	loff_t old_size;
 	ssize_t res;
 
 	/*
@@ -745,19 +753,27 @@ static ssize_t fusex_direct_write(struct kiocb *iocb, struct iov_iter *from, siz
 	if (res && res != -EBUSY)
 		return res;
 
+	/*
+	 * A hole exposes the rest of the folio at EOF.  Write it back while the
+	 * size still leaves out what was mapped past EOF.  Zeroing it later
+	 * could hit another writer's data in the hole.
+	 */
+	if (pos > size) {
+		res = invalidate_inode_pages2_range(inode->i_mapping, size >> PAGE_SHIFT,
+						    (pos - 1) >> PAGE_SHIFT);
+		if (res && res != -EBUSY)
+			return res;
+	}
+
 	res = fusex_direct_io(iocb, from, count);
 	if (res <= 0)
 		return res;
 
 	/* Before the invalidation: a fault after it must see the new size */
-	old_size = fusex_grow_size(inode, iocb->ki_pos);
-	fusex_extend_file(inode, old_size, pos);
+	fusex_grow_size(inode, iocb->ki_pos, attr_version);
 
-	/*
-	 * A fault during the write can have read the old data.  Another writer
-	 * can be in the hole, so the folio zeroed for it can't stay either.
-	 */
-	invalidate_inode_pages2_range(inode->i_mapping, min(old_size, pos) >> PAGE_SHIFT,
+	/* A fault during the write can have read the old data */
+	invalidate_inode_pages2_range(inode->i_mapping, pos >> PAGE_SHIFT,
 				      (iocb->ki_pos - 1) >> PAGE_SHIFT);
 	fuse_invalidate_attr_mask(inode, FUSE_STATX_MODIFY);
 
@@ -765,17 +781,23 @@ static ssize_t fusex_direct_write(struct kiocb *iocb, struct iov_iter *from, siz
 }
 
 /*
- * The data goes to the server, which orders the writes.  Only append needs EOF,
- * and removing privileges can't run next to other writers.
+ * The data goes to the server, which orders the writes.  Only append needs EOF
+ * under the lock, and removing privileges can't run next to other writers.
  */
 static ssize_t fusex_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
 	struct inode *inode = file_inode(file);
 	bool append = iocb->ki_flags & IOCB_APPEND;
-	bool excl = append || !IS_NOSEC(inode);
-	ssize_t res = 0;
+	bool excl;
+	ssize_t res;
 
+	/* After a notify: the mode picks the lock, EOF what a hole exposes */
+	res = fusex_refresh_attr(inode, STATX_SIZE | FUSEX_ATTR_PERM);
+	if (res)
+		return res;
+
+	excl = append || !IS_NOSEC(inode);
 	if (!excl) {
 		inode_lock_shared(inode);
 		if (!IS_NOSEC(inode)) {
@@ -827,6 +849,7 @@ static long fusex_file_fallocate(struct file *file, int mode, loff_t offset, lof
 		.mode = mode
 	};
 	off_t end = offset + length;
+	u64 attr_version;
 	int err;
 
 	if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE |
@@ -855,6 +878,7 @@ static long fusex_file_fallocate(struct file *file, int mode, loff_t offset, lof
 	if (err)
 		return err;
 
+	attr_version = fuse_get_attr_version(get_fuse_conn(inode));
 	args.opcode = FUSE_FALLOCATE;
 	ADD_IN_ARG_S(args, &inarg);
 	err = fusex_inode_request(inode, &args);
@@ -862,7 +886,7 @@ static long fusex_file_fallocate(struct file *file, int mode, loff_t offset, lof
 		return err;
 
 	if (!(mode & FALLOC_FL_KEEP_SIZE)) {
-		loff_t old_size = fusex_grow_size(inode, end);
+		loff_t old_size = fusex_grow_size(inode, end, attr_version);
 
 		fusex_extend_file(inode, old_size, end);
 	}
