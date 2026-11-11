@@ -2071,6 +2071,8 @@ static int fusex_send_init(struct fs_context *fsc, struct fuse_mount *fm,
 	if (outarg_in.max_write > max_payload)
 		return invalfc(fsc, "max_write %u exceeds the ring payload buffer %zu",
 			       outarg_in.max_write, max_payload);
+	if (!outarg_in.max_write)
+		return invalfc(fsc, "max_write is 0");
 
 	fm->fc->max_write = outarg_in.max_write;
 	fm->fc->max_pages = min_t(size_t, max_payload >> PAGE_SHIFT,
