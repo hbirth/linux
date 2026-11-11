@@ -197,11 +197,16 @@ static void fusex_get_ctime(const struct inode *inode, struct fuse_statx *sx)
 /* The cache is the server's, sync(2) has to reach it */
 static int fusex_sync_fs(struct super_block *sb, int wait)
 {
+	struct fuse_conn *fc = get_fuse_conn_super(sb);
 	FUSE_ARGS(args);
 	struct fuse_syncfs_in inarg;
 	int err;
 
-	if (!wait)
+	if (!wait || fc->no_syncfs)
+		return 0;
+
+	/* An unprivileged server must not hold up everybody's sync(2) */
+	if (sb->s_iflags & SB_I_UNTRUSTED_MOUNTER)
 		return 0;
 
 	/* generic_shutdown_super() syncs after clearing s_root, the server is gone */
@@ -212,8 +217,12 @@ static int fusex_sync_fs(struct super_block *sb, int wait)
 	args.opcode = FUSE_SYNCFS;
 	ADD_IN_ARG_S(args, &inarg);
 	err = fusex_inode_request(d_inode(sb->s_root), &args);
+	if (err == -ENOSYS) {
+		fc->no_syncfs = 1;
+		err = 0;
+	}
 
-	return err == -ENOSYS ? 0 : err;
+	return err;
 }
 
 static int fusex_statfs(struct dentry *dentry, struct kstatfs *buf)
@@ -2116,8 +2125,9 @@ static int fusex_fill_super(struct super_block *sb, struct fs_context *fsc)
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	sb->s_time_gran = 1;
 	sb->s_iflags |= SB_I_IMA_UNVERIFIABLE_SIGNATURE;
+	/* sync(2) doesn't wait for the writeback to an unprivileged server either */
 	if (sb->s_user_ns != &init_user_ns)
-		sb->s_iflags |= SB_I_UNTRUSTED_MOUNTER;
+		sb->s_iflags |= SB_I_UNTRUSTED_MOUNTER | SB_I_NO_DATA_INTEGRITY;
 	sb->s_blocksize = PAGE_SIZE;
 	sb->s_blocksize_bits = PAGE_SHIFT;
 	sb->s_flags &= SB_RDONLY;

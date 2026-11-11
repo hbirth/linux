@@ -158,6 +158,9 @@ struct fuse_conn {
 	/** @destroy: Send DESTROY request */
 	unsigned int destroy:1;
 
+	/** @no_syncfs: The server doesn't implement SYNCFS */
+	unsigned int no_syncfs:1;
+
 	/** @entry: Entry on the fuse_conn_list */
 	struct list_head entry;
 
