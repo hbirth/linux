@@ -28,6 +28,17 @@ void fuse_invalidate_attr(struct inode *inode)
 	fuse_invalidate_attr_mask(inode, STATX_BASIC_STATS);
 }
 
+/* A fetch sets nlink under fi->lock */
+void fuse_drop_nlink(struct inode *inode)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+
+	spin_lock(&fi->lock);
+	if (inode->i_nlink)
+		drop_nlink(inode);
+	spin_unlock(&fi->lock);
+}
+
 static void fuse_dir_changed(struct inode *dir)
 {
 	fuse_invalidate_attr_mask(dir, FUSE_STATX_MODDIR);
@@ -105,8 +116,7 @@ int fuse_reverse_inval_entry(struct fuse_conn *fc, u64 parent_nodeid,
 		}
 		dont_mount(entry);
 		/* It can have other names, the attributes tell */
-		if (d_inode(entry)->i_nlink)
-			drop_nlink(d_inode(entry));
+		fuse_drop_nlink(d_inode(entry));
 		fuse_invalidate_attr(d_inode(entry));
 		err = 0;
  badentry:

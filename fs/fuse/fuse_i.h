@@ -280,6 +280,7 @@ int fuse_simple_background(struct fuse_mount *fm, struct fuse_args *args,
 
 void fuse_invalidate_attr(struct inode *inode);
 void fuse_invalidate_attr_mask(struct inode *inode, u32 mask);
+void fuse_drop_nlink(struct inode *inode);
 
 void fuse_invalidate_atime(struct inode *inode);
 

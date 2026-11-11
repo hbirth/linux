@@ -1328,16 +1328,20 @@ static int fusex_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
 	if (update_mode) {
 		struct fuse_setstatx_in inarg;
 
-		inode->i_mode = mode;
 		memset(&inarg, 0, sizeof(inarg));
 		inarg.stat.mask |= STATX_MODE;
-		inarg.stat.mode = inode->i_mode & 07777;
+		inarg.stat.mode = mode & 07777;
 
+		/* Like setattr: a fetch that has the old mode must not apply */
 		err = fusex_send_setstatx(inode, &inarg);
+		if (err)
+			return err;
+
 		fusex_attr_changed(inode);
+		inode->i_mode = mode;
 	}
 
-	return err;
+	return 0;
 }
 
 static int fusex_send_mkobjx(struct inode *dir, struct inode *inode,
@@ -1581,8 +1585,7 @@ static int fusex_remove(struct inode *dir, struct dentry *dentry)
 		return err;
 
 	fusex_attr_changed(inode);
-	if (inode->i_nlink)
-		drop_nlink(inode);
+	fuse_drop_nlink(inode);
 	fusex_ctime_changed(inode);
 	fusex_dir_modified(dir);
 
@@ -1697,8 +1700,8 @@ static int fusex_rename(struct mnt_idmap *idmap, struct inode *olddir,
 	fusex_ctime_changed(oldinode);
 	if (newinode) {
 		fusex_attr_changed(newinode);
-		if (!(flags & RENAME_EXCHANGE) && newinode->i_nlink)
-			drop_nlink(newinode);
+		if (!(flags & RENAME_EXCHANGE))
+			fuse_drop_nlink(newinode);
 		fusex_ctime_changed(newinode);
 	}
 
